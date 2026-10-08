@@ -1,13 +1,9 @@
-import { useMemo, useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from "recharts";
 import { Activity, AlertTriangle, CheckCircle, XCircle, TrendingUp, TrendingDown, Minus, RefreshCw, Settings } from "lucide-react";
 import StatusBadge from '../../components/StatusBadge';
-import EmptyState from '../../components/common/EmptyState';
-import { EMPTY_STATE_STRATEGY_HEALTH } from '../../utils/emptyStateCopy';
 import { FreshnessBanner } from "../../components/dashboard/FreshnessBanner";
-import { stableSort } from "../../lib/stableSort";
 import { RISK_CHART_COLORS, CHART_PANEL_BG, CHART_PANEL_AXIS } from "../../components/charts/darkModeContrast";
-import { useCachedFetch } from "../../hooks/useCachedFetch";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -92,35 +88,46 @@ function formatLatency(ms: number): string {
 // ── Component ───────────────────────────────────────────────────────────
 
 export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'strategy_2', 'strategy_3', 'strategy_4'] }: StrategyHealthPanelProps) {
+  const [healthScores, setHealthScores] = useState<StrategyHealthScore[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [selectedStrategy, setSelectedStrategy] = useState<StrategyHealthScore | null>(null);
-  const strategyIdsKey = useMemo(() => JSON.stringify(strategyIds), [strategyIds]);
-  const init = useMemo(() => ({
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ strategyIds }),
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [strategyIdsKey]);
-
-  const {
-    data: healthScores,
-    isLoading,
-    error,
-    isOffline,
-    isFromCache,
-    fetchedAt,
-    refresh: fetchHealthScores,
-  } = useCachedFetch<StrategyHealthScore[]>('/api/analytics/health/batch', {
-    init,
-    select: (json) => (json as { data: StrategyHealthScore[] }).data,
-  });
 
   useEffect(() => {
-    if (healthScores && healthScores.length > 0 && !selectedStrategy) {
-      setSelectedStrategy(healthScores[0]);
+    fetchHealthScores();
+  }, [strategyIds]);
+
+  const fetchHealthScores = async () => {
+    try {
+      setIsLoading(true);
+      setError(null);
+
+      const response = await fetch('/api/analytics/health/batch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ strategyIds }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      setHealthScores(data.data);
+      
+      // Select first strategy by default
+      if (data.data.length > 0) {
+        setSelectedStrategy(data.data[0]);
+      }
+    } catch (err) {
+      console.error("Failed to fetch health scores:", err);
+      setError(err instanceof Error ? err.message : "Failed to fetch health scores");
+    } finally {
+      setIsLoading(false);
     }
-  }, [healthScores, selectedStrategy]);
+  };
 
   const getRadarData = (metrics: StrategyHealthMetrics) => [
     { metric: 'Contract Safety', value: metrics.contractSafety * 100, fullMark: 100 },
@@ -131,7 +138,7 @@ export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'stra
     { metric: 'Low Volatility', value: (1 - metrics.volatilityIndex) * 100, fullMark: 100 },
   ];
 
-  if (isLoading && !healthScores) {
+  if (isLoading) {
     return (
       <div className="glass-panel p-8">
         <div className="flex items-center justify-center py-12">
@@ -141,14 +148,14 @@ export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'stra
     );
   }
 
-  if (error && (!healthScores || healthScores.length === 0)) {
+  if (error) {
     return (
       <div className="glass-panel p-8" data-testid="strategy-health-error">
         <div className="text-center py-12">
           <AlertTriangle className="mx-auto mb-4 text-red-400" size={48} />
           <h3 className="text-lg font-semibold mb-2">Health data is currently unavailable</h3>
           <p className="text-gray-400 mb-4">{error}</p>
-          <button onClick={() => fetchHealthScores()} className="btn-primary">
+          <button onClick={fetchHealthScores} className="btn-primary">
             Try again
           </button>
         </div>
@@ -156,15 +163,16 @@ export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'stra
     );
   }
 
-  if (!healthScores || healthScores.length === 0) {
+  if (healthScores.length === 0) {
     return (
       <div className="glass-panel p-8" data-testid="strategy-health-empty">
-        <EmptyState
-          icon={<Activity className="text-gray-400" size={48} />}
-          title={EMPTY_STATE_STRATEGY_HEALTH.title}
-          description={EMPTY_STATE_STRATEGY_HEALTH.description}
-          testId="strategy-health-empty-state"
-        />
+        <div className="text-center py-12">
+          <Activity className="mx-auto mb-4 text-gray-400" size={48} />
+          <h3 className="text-lg font-semibold mb-2">No strategy health data yet</h3>
+          <p className="text-gray-400">
+            Health scores will appear here once strategies report a snapshot.
+          </p>
+        </div>
       </div>
     );
   }
@@ -179,39 +187,15 @@ export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'stra
             Real-time health monitoring for all strategies
           </p>
         </div>
-        <button onClick={() => fetchHealthScores()} className="btn-secondary flex items-center gap-2">
+        <button onClick={fetchHealthScores} className="btn-secondary flex items-center gap-2">
           <RefreshCw size={14} />
           Refresh
         </button>
       </div>
 
-      {(isOffline || isFromCache) && (
-        <FreshnessBanner
-          lastUpdated={fetchedAt != null ? new Date(fetchedAt).toISOString() : undefined}
-          source="cache"
-          isOffline={isOffline}
-          onRefresh={() => fetchHealthScores()}
-        />
-      )}
-
       {/* Strategy Overview Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        {stableSort(
-          healthScores,
-          (a, b) => {
-            // Unhealthy strategies surface first, then score (#1118).
-            const severity = {
-              critical: 0,
-              degraded: 1,
-              healthy: 2,
-              disabled: 3,
-            } as const;
-            const bySeverity = severity[a.status] - severity[b.status];
-            if (bySeverity !== 0) return bySeverity;
-            return b.overallScore - a.overallScore;
-          },
-          (score) => score.strategyId,
-        ).map((score) => (
+        {healthScores.map((score) => (
           <div
             key={score.strategyId}
             className={`glass-card p-4 cursor-pointer transition-all duration-200 ${
@@ -399,15 +383,7 @@ export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'stra
       <div className="glass-panel p-6">
         <h3 className="text-lg font-semibold mb-4">Recent Health Signals</h3>
         <div className="space-y-3">
-          {selectedStrategy &&
-            stableSort(
-              selectedStrategy.signals,
-              (a, b) =>
-                new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-              (signal) => `${signal.source}|${signal.metric}`,
-            )
-              .slice(0, 5)
-              .map((signal, index) => (
+          {selectedStrategy?.signals.slice(0, 5).map((signal, index) => (
             <div key={index} className="flex items-center justify-between text-sm border-b border-white/5 pb-2">
               <div className="flex items-center gap-3">
                 <span className="text-gray-400">{signal.source}</span>

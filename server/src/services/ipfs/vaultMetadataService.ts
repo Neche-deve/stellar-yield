@@ -1,6 +1,5 @@
 import crypto from "crypto";
 import { validateIconAssetOrThrow, DEFAULT_ICON_CONFIG } from "../../utils/iconValidator";
-import { enqueueAdapterRequest } from "../../agents/adapterRetryQueue";
 
 export interface VaultMetadataInput {
   vaultName: string;
@@ -111,16 +110,13 @@ async function uploadSvgToPinata(svg: string, pinataJwt: string): Promise<string
   const svgBlob = new Blob([svg], { type: "image/svg+xml" });
   body.append("file", svgBlob, "vault-icon.svg");
 
-  const response = await enqueueAdapterRequest(
-    () =>
-      fetch(PINATA_FILE_API, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${pinataJwt}` },
-        body,
-      }),
-    "pinata-ipfs",
-    { maxRetries: 3, initialDelayMs: 1_000, maxDelayMs: 16_000 },
-  );
+  const response = await fetch(PINATA_FILE_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${pinataJwt}`,
+    },
+    body,
+  });
 
   if (!response.ok) {
     const text = await response.text();
@@ -139,22 +135,19 @@ async function uploadJsonToPinata(
   payload: VaultMetadataPayload,
   pinataJwt: string,
 ): Promise<string> {
-  const response = await enqueueAdapterRequest(
-    () =>
-      fetch(PINATA_JSON_API, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${pinataJwt}`,
-        },
-        body: JSON.stringify({
-          pinataContent: payload,
-          pinataMetadata: { name: `vault-metadata-${payload.name}.json` },
-        }),
-      }),
-    "pinata-ipfs",
-    { maxRetries: 3, initialDelayMs: 1_000, maxDelayMs: 16_000 },
-  );
+  const response = await fetch(PINATA_JSON_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${pinataJwt}`,
+    },
+    body: JSON.stringify({
+      pinataContent: payload,
+      pinataMetadata: {
+        name: `vault-metadata-${payload.name}.json`,
+      },
+    }),
+  });
 
   if (!response.ok) {
     const text = await response.text();

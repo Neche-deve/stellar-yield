@@ -206,7 +206,7 @@ describe("Leaderboard", () => {
       fireEvent.click(retryButton);
 
       await waitFor(() => {
-        expect(screen.getByText(/GAAAAA\.\.\./)).toBeInTheDocument();
+        expect(screen.getByText(/GAAAAAA\.\.\./)).toBeInTheDocument();
       });
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -253,7 +253,7 @@ describe("Leaderboard", () => {
       render(<Leaderboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/GAAAAA\.\.\./)).toBeInTheDocument();
+        expect(screen.getByText(/GAAAAAA\.\.\./)).toBeInTheDocument();
       });
     });
 
@@ -325,7 +325,7 @@ describe("Leaderboard", () => {
       render(<Leaderboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/GAAAAA\.\.\./)).toBeInTheDocument();
+        expect(screen.getByText(/GAAAAAA\.\.\./)).toBeInTheDocument();
       });
     });
 
@@ -355,8 +355,8 @@ describe("Leaderboard", () => {
       render(<Leaderboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/GAAAAA\.\.\.AWHF/)).toBeInTheDocument();
-        expect(screen.getByText(/GBBBBB\.\.\.BBBB/)).toBeInTheDocument();
+        expect(screen.getByText(/GAAAAAA\.\.\.AWHF/)).toBeInTheDocument();
+        expect(screen.getByText(/GBBBBBB\.\.\.BBBB/)).toBeInTheDocument();
       });
     });
   });

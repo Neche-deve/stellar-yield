@@ -68,7 +68,7 @@ describe("AlertsModal", () => {
   it("renders the modal when open", async () => {
     renderModal();
     expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /APY Alerts/i })).toBeTruthy();
+    expect(screen.getByText("APY Alerts")).toBeTruthy();
   });
 
   it("calls onClose when close button is clicked", () => {

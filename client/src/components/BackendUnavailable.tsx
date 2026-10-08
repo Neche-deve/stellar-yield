@@ -1,6 +1,5 @@
 import React from "react";
-import { AlertCircle, WifiOff, RefreshCw, Activity } from "lucide-react";
-import { openDiagnosticsPanel } from "../lib/config";
+import { AlertCircle, WifiOff, RefreshCw } from "lucide-react";
 
 export interface BackendUnavailableProps {
   featureName: string;
@@ -27,7 +26,7 @@ export function BackendUnavailable({
         {onRetry && (
           <button
             onClick={onRetry}
-            className="ml-auto p-1 hover:bg-amber-500/20 rounded transition-colors text-amber-300"
+            className="ml-auto p-1 hover:bg-amber-500/20 rounded transition-colors"
             title="Retry"
           >
             <RefreshCw size={14} />
@@ -55,25 +54,15 @@ export function BackendUnavailable({
             </p>
           </div>
 
-          <div className="mt-4 flex items-center gap-3 flex-wrap justify-center">
-            {onRetry && (
-              <button
-                onClick={onRetry}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-medium transition-colors"
-              >
-                <RefreshCw size={16} />
-                Try Again
-              </button>
-            )}
+          {onRetry && (
             <button
-              type="button"
-              onClick={() => openDiagnosticsPanel()}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors border border-slate-700"
+              onClick={onRetry}
+              className="mt-4 flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-medium transition-colors"
             >
-              <Activity size={15} className="text-indigo-400" />
-              Check Diagnostics
+              <RefreshCw size={16} />
+              Try Again
             </button>
-          </div>
+          )}
         </div>
       </div>
     </div>

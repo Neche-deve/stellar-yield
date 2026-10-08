@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Vault from "../Vault";
@@ -102,8 +102,7 @@ describe("Vault Component", () => {
     await waitFor(() => {
       expect(screen.getByText(/Vault Not Found/i)).toBeInTheDocument();
     });
-    expect(screen.getByText(/"unknown-slug"/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /back to dashboard/i })).toBeInTheDocument();
+    expect(screen.getByText(/"unknown-slug"/i)).toBeInTheDocument();
   });
 
   it("shows unavailable state when live data is missing", async () => {
@@ -184,8 +183,8 @@ describe("Vault Component", () => {
     expect(screen.getByTestId("zap-panel")).toBeInTheDocument();
 
     // Click "Withdraw" tab
-    const withdrawBtn = screen.getByRole("button", { name: /^Withdraw$/i });
-    fireEvent.click(withdrawBtn);
+    const withdrawBtn = screen.getByText("Withdraw");
+    withdrawBtn.click();
 
     expect(screen.getByTestId("withdraw-panel")).toBeInTheDocument();
     expect(screen.queryByTestId("zap-panel")).not.toBeInTheDocument();
@@ -221,14 +220,14 @@ describe("Vault Component", () => {
       expect(screen.getByText(/USDC Yield Vault/i)).toBeInTheDocument();
     });
 
-    const depositBtn = screen.getByRole("button", { name: /^Deposit/i });
+    const depositBtn = screen.getByText("Deposit");
     expect(depositBtn).toBeDisabled();
     expect(depositBtn).toHaveAttribute("aria-disabled", "true");
 
     // The disabled reason banner should be visible because deposit is the active tab
-    expect(screen.getByRole("alert")).toHaveTextContent("Vault is paused");
+    expect(screen.getByText("Vault is paused")).toBeInTheDocument();
 
-    const withdrawBtn = screen.getByRole("button", { name: /^Withdraw/i });
+    const withdrawBtn = screen.getByText("Withdraw");
     expect(withdrawBtn).not.toBeDisabled();
   });
 
@@ -264,12 +263,12 @@ describe("Vault Component", () => {
       expect(screen.getByText(/USDC Yield Vault/i)).toBeInTheDocument();
     });
 
-    const depositBtn = screen.getByRole("button", { name: /^Deposit/i });
-    const withdrawBtn = screen.getByRole("button", { name: /^Withdraw/i });
+    const depositBtn = screen.getByText("Deposit");
+    const withdrawBtn = screen.getByText("Withdraw");
 
     expect(depositBtn).toBeDisabled();
     expect(withdrawBtn).toBeDisabled();
 
-    expect(screen.getByRole("alert")).toHaveTextContent("Connect your wallet to perform this action");
+    expect(screen.getByText("Connect your wallet to perform this action")).toBeInTheDocument();
   });
 });

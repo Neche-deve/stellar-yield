@@ -34,14 +34,6 @@ export interface ErrorDetail {
   message: string;
   /** Optional field-level or contextual details. */
   details?: unknown;
-  /**
-   * Coarse failure category for export errors (#1122): "validation" |
-   * "timeout" | "service_failure". Lets the UI branch without inspecting
-   * every code.
-   */
-  category?: string;
-  /** Whether retrying the same request may succeed later. */
-  retryable?: boolean;
 }
 
 // ── Error envelope ────────────────────────────────────────────────────────
@@ -85,14 +77,12 @@ export function successEnvelope<T>(
  * @param message - Human-readable error description.
  * @param route   - The route identifier.
  * @param details - Optional extra context (field errors, upstream message…).
- * @param classification - Optional failure category + retryability (#1122).
  */
 export function errorEnvelope(
   code: string,
   message: string,
   route: string,
   details?: unknown,
-  classification?: { category?: string; retryable?: boolean },
 ): ErrorEnvelope {
   const meta: ResponseMeta = {
     generatedAt: new Date().toISOString(),
@@ -100,13 +90,7 @@ export function errorEnvelope(
   };
   return {
     ok: false,
-    error: {
-      code,
-      message,
-      ...(details !== undefined ? { details } : {}),
-      ...(classification?.category !== undefined ? { category: classification.category } : {}),
-      ...(classification?.retryable !== undefined ? { retryable: classification.retryable } : {}),
-    },
+    error: { code, message, ...(details !== undefined ? { details } : {}) },
     meta,
   };
 }

@@ -4,14 +4,8 @@ import {
   filterReportsWithActivity,
   getReportStatistics,
   exportReportsToCSV,
-  runWeeklyReportGenerationWithTracking,
-  getWeeklyReportHealth,
-  generateCatchUpReports,
-  getPeriodsNeedingCatchUp,
-  WeeklyReportHealthCheck,
 } from "../services/weeklyYieldReportService";
 import { sendBatchEmails } from "../services/emailService";
-import { toExportFailure, lookupExportFailure } from "../types/exportFailure";
 
 /**
  * Weekly Yield Report Job
@@ -24,8 +18,6 @@ export interface JobConfig {
   sendEmails: boolean;
   filterByActivity: boolean;
   logResults: boolean;
-  enableCatchUp: boolean; // Enable catch-up generation for missed periods
-  maxCatchUpPeriods: number; // Maximum number of past periods to catch up
 }
 
 let jobHandle: ReturnType<typeof cron.schedule> | null = null;
@@ -42,8 +34,6 @@ export function startWeeklyYieldReportJob(
     sendEmails: config.sendEmails !== false,
     filterByActivity: config.filterByActivity !== false,
     logResults: config.logResults !== false,
-    enableCatchUp: config.enableCatchUp !== false,
-    maxCatchUpPeriods: config.maxCatchUpPeriods ?? 4,
   };
 
   if (!finalConfig.enabled) {
@@ -76,7 +66,7 @@ export function stopWeeklyYieldReportJob(): void {
 }
 
 /**
- * Run the weekly yield report job with tracking and catch-up
+ * Run the weekly yield report job
  */
 export async function runWeeklyYieldReportJob(config: JobConfig): Promise<{
   success: boolean;
@@ -85,18 +75,13 @@ export async function runWeeklyYieldReportJob(config: JobConfig): Promise<{
   emailsFailed: number;
   statistics: Record<string, unknown>;
   timestamp: string;
-  currentPeriodStatus: string;
-  catchUpResults: Array<{ periodStart: Date; periodEnd: Date; success: boolean; error?: string }>;
-  healthCheck: WeeklyReportHealthCheck;
 }> {
   const startTime = Date.now();
-  console.log("Running weekly yield report job with tracking...");
+  console.log("Running weekly yield report job...");
 
   try {
-    // Run generation with tracking (includes catch-up)
-    const trackingResult = await runWeeklyReportGenerationWithTracking();
-
-    // Get reports for email sending (current period)
+    // Generate reports
+    console.log("Generating weekly yield reports...");
     let reports = await generateWeeklyYieldReports();
 
     // Filter by activity if configured
@@ -115,7 +100,7 @@ export async function runWeeklyYieldReportJob(config: JobConfig): Promise<{
       console.log("Report Statistics:", statistics);
     }
 
-    // Send emails for current period reports
+    // Send emails
     let emailsSent = 0;
     let emailsFailed = 0;
 
@@ -145,40 +130,23 @@ export async function runWeeklyYieldReportJob(config: JobConfig): Promise<{
       }
     }
 
-    // Get health check for monitoring
-    const healthCheck = await getWeeklyReportHealth();
-
     const duration = Date.now() - startTime;
     const result = {
-      success: trackingResult.success,
-      reportsGenerated: trackingResult.reportsGenerated,
+      success: true,
+      reportsGenerated: reports.length,
       emailsSent,
       emailsFailed,
       statistics,
       timestamp: new Date().toISOString(),
-      currentPeriodStatus: trackingResult.currentPeriodStatus,
-      catchUpResults: trackingResult.catchUpResults,
-      healthCheck,
     };
 
     if (config.logResults) {
-      console.log(`Weekly yield report job completed in ${duration}ms`, {
-        success: result.success,
-        reportsGenerated: result.reportsGenerated,
-        currentPeriodStatus: result.currentPeriodStatus,
-        catchUpCount: result.catchUpResults.length,
-        healthSummary: result.healthCheck.summary,
-      });
+      console.log(`Weekly yield report job completed in ${duration}ms`, result);
     }
 
     return result;
   } catch (error) {
-    const failure = toExportFailure(error);
-    const descriptor = lookupExportFailure(failure.code);
     console.error("Weekly yield report job error:", error);
-    if (descriptor?.recoveryNote) {
-      console.error("Recovery note:", descriptor.recoveryNote);
-    }
     throw error;
   }
 }
@@ -195,8 +163,6 @@ export async function runWeeklyYieldReportJobNow(): Promise<
     sendEmails: true,
     filterByActivity: true,
     logResults: true,
-    enableCatchUp: true,
-    maxCatchUpPeriods: 4,
   };
 
   return runWeeklyYieldReportJob(config);
@@ -221,29 +187,4 @@ export function getJobStatus(): {
 export async function exportWeeklyReports(): Promise<string> {
   const reports = await generateWeeklyYieldReports();
   return exportReportsToCSV(reports);
-}
-
-/**
- * Get weekly report health check
- */
-export async function getWeeklyReportHealthCheck(): Promise<WeeklyReportHealthCheck> {
-  return getWeeklyReportHealth();
-}
-
-/**
- * Manually trigger catch-up generation for missed periods
- */
-export async function triggerCatchUpGeneration(
-  maxPeriods: number = 4,
-): Promise<Array<{ periodStart: Date; periodEnd: Date; success: boolean; error?: string }>> {
-  return generateCatchUpReports("weekly-yield-report", maxPeriods);
-}
-
-/**
- * Get periods that need catch-up
- */
-export async function getCatchUpPeriods(
-  maxPeriods: number = 4,
-): Promise<Array<{ periodStart: Date; periodEnd: Date; status: string }>> {
-  return getPeriodsNeedingCatchUp("weekly-yield-report", maxPeriods);
 }

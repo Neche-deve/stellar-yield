@@ -2,10 +2,6 @@ import { render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import StrategyComparison from './StrategyComparison';
 
-vi.mock('../../hooks/useBackendStatus', () => ({
-  useBackendStatus: vi.fn(() => 'available'),
-}));
-
 // Mock matchMedia for recharts/lucide-react inner behaviors if needed
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -128,8 +124,8 @@ describe('StrategyComparison Component', () => {
     render(<StrategyComparison />);
 
     await waitFor(() => {
-      expect(screen.getByText('Strategy Comparison Temporarily Unavailable')).toBeInTheDocument();
-      expect(screen.getByText('The backend service is currently disconnected or unavailable. Please try again later.')).toBeInTheDocument();
+      expect(screen.getByText('Failed to Load Strategy Data')).toBeInTheDocument();
+      expect(screen.getByText('Network offline')).toBeInTheDocument();
     });
   });
 

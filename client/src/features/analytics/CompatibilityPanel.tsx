@@ -5,12 +5,7 @@ import {
   TrendingUp, BarChart3, DollarSign,
 } from "lucide-react";
 import StatusBadge from '../../components/StatusBadge';
-import EmptyState from '../../components/common/EmptyState';
-import { EMPTY_STATE_COMPATIBILITY } from '../../utils/emptyStateCopy';
 import { RISK_CHART_COLORS } from "../../components/charts/darkModeContrast";
-import { stableSort } from "../../lib/stableSort";
-import { useCachedFetch } from "../../hooks/useCachedFetch";
-import { FreshnessBanner } from "../../components/dashboard/FreshnessBanner";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -36,10 +31,6 @@ interface CompatibilityIssue {
   affectedStrategies: string[];
   affectedActions?: ActionType[];
   lastUpdated?: string;
-  /** Machine-readable code explaining why the source was downgraded. */
-  fallbackReasonCode?: string;
-  /** Human-readable sentence explaining the downgrade reason. */
-  fallbackReason?: string;
 }
 
 interface CompatibilityStatus {
@@ -53,13 +44,6 @@ interface CompatibilityStatus {
   autoUpdateAvailable: boolean;
 }
 
-interface RegistryWarning {
-  code: string;
-  message: string;
-  network?: string;
-  contract?: string;
-}
-
 interface CompatibilityReport {
   overallStatus: 'compatible' | 'degraded' | 'incompatible';
   protocols: CompatibilityStatus[];
@@ -67,8 +51,6 @@ interface CompatibilityReport {
   actionGroups: ActionGroup[];
   generatedAt: string;
   nextCheckDue: string;
-  /** Warnings from registry metadata loading — present when data is incomplete. */
-  registryWarnings?: RegistryWarning[];
 }
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -130,43 +112,47 @@ function sortIssues(issues: CompatibilityIssue[]): CompatibilityIssue[] {
 
     const dateA = a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0;
     const dateB = b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0;
-    if (dateA !== dateB) return dateB - dateA;
-
-    // Deterministic tiebreak (#1118): component → protocol → issue text, so
-    // equal-severity/equal-date rows keep the same order across refreshes.
-    const byComponent = a.component.localeCompare(b.component);
-    if (byComponent !== 0) return byComponent;
-    const byProtocol = (a.protocolName ?? "").localeCompare(b.protocolName ?? "");
-    if (byProtocol !== 0) return byProtocol;
-    return a.issue.localeCompare(b.issue);
+    return dateB - dateA;
   });
 }
 
 // ── Component ───────────────────────────────────────────────────────────
 
 export default function CompatibilityPanel() {
+  const [report, setReport] = useState<CompatibilityReport | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [selectedProtocol, setSelectedProtocol] = useState<CompatibilityStatus | null>(null);
   const [activeAction, setActiveAction] = useState<ActionType>('deposit');
-  const {
-    data: report,
-    isLoading,
-    error,
-    isOffline,
-    isFromCache,
-    fetchedAt,
-    refresh: fetchCompatibilityReport,
-  } = useCachedFetch<CompatibilityReport>('/api/analytics/compatibility', {
-    select: (json) => (json as { data: CompatibilityReport }).data,
-  });
 
   useEffect(() => {
-    if (report && report.protocols.length > 0 && !selectedProtocol) {
-      setSelectedProtocol(report.protocols[0]);
-    }
-  }, [report, selectedProtocol]);
+    fetchCompatibilityReport();
+  }, []);
 
-  /** Registry warnings surfaced when metadata loading fails or is partial. */
-  const registryWarnings = report?.registryWarnings ?? [];
+  const fetchCompatibilityReport = async () => {
+    try {
+      setIsLoading(true);
+      setError(null);
+
+      const response = await fetch('/api/analytics/compatibility');
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      setReport(data.data);
+
+      if (data.data.protocols.length > 0) {
+        setSelectedProtocol(data.data.protocols[0]);
+      }
+    } catch (err) {
+      console.error("Failed to fetch compatibility report:", err);
+      setError(err instanceof Error ? err.message : "Failed to fetch compatibility report");
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   // Protocol issues grouped by action (used for the protocol detail view)
   const protocolActionGroups = useMemo(() => {
@@ -186,7 +172,7 @@ export default function CompatibilityPanel() {
 
   // ── Loading ───────────────────────────────────────────────────────────
 
-  if (isLoading && !report) {
+  if (isLoading) {
     return (
       <div className="glass-panel p-8">
         <div className="flex items-center justify-center py-12">
@@ -198,14 +184,14 @@ export default function CompatibilityPanel() {
 
   // ── Error ─────────────────────────────────────────────────────────────
 
-  if (error && !report) {
+  if (error) {
     return (
       <div className="glass-panel p-8">
         <div className="text-center py-12">
           <AlertTriangle className="mx-auto mb-4 text-red-400" size={48} />
           <h3 className="text-lg font-semibold mb-2">Compatibility Data Unavailable</h3>
           <p className="text-gray-400 mb-4">{error}</p>
-          <button onClick={() => fetchCompatibilityReport()} className="btn-primary">
+          <button onClick={fetchCompatibilityReport} className="btn-primary">
             Retry
           </button>
         </div>
@@ -218,12 +204,11 @@ export default function CompatibilityPanel() {
   if (!report) {
     return (
       <div className="glass-panel p-8">
-        <EmptyState
-          icon={<Shield className="text-gray-400" size={48} />}
-          title={EMPTY_STATE_COMPATIBILITY.title}
-          description={EMPTY_STATE_COMPATIBILITY.description}
-          testId="compatibility-empty-state"
-        />
+        <div className="text-center py-12">
+          <Shield className="mx-auto mb-4 text-gray-400" size={48} />
+          <h3 className="text-lg font-semibold mb-2">No Compatibility Data</h3>
+          <p className="text-gray-400">Unable to load compatibility information.</p>
+        </div>
       </div>
     );
   }
@@ -240,18 +225,15 @@ export default function CompatibilityPanel() {
               Monitor protocol upgrade compatibility and detect breaking changes
             </p>
           </div>
-          <button onClick={() => fetchCompatibilityReport()} className="btn-secondary flex items-center gap-2">
+          <button onClick={fetchCompatibilityReport} className="btn-secondary flex items-center gap-2">
             <RefreshCw size={14} />
             Refresh
           </button>
         </div>
-        <div className="glass-panel p-12">
-          <EmptyState
-            icon={<Shield className="text-gray-400" size={48} />}
-            title={EMPTY_STATE_COMPATIBILITY.title}
-            description={EMPTY_STATE_COMPATIBILITY.description}
-            testId="compatibility-no-protocols-empty-state"
-          />
+        <div className="glass-panel p-12 text-center">
+          <Shield className="mx-auto mb-4 text-gray-400" size={48} />
+          <h3 className="text-lg font-semibold mb-2">No Protocols Registered</h3>
+          <p className="text-gray-400">Add protocols to begin monitoring compatibility.</p>
         </div>
       </div>
     );
@@ -277,51 +259,11 @@ export default function CompatibilityPanel() {
             Monitor protocol upgrade compatibility and detect breaking changes
           </p>
         </div>
-        <button onClick={() => fetchCompatibilityReport()} className="btn-secondary flex items-center gap-2">
+        <button onClick={fetchCompatibilityReport} className="btn-secondary flex items-center gap-2">
           <RefreshCw size={14} />
           Refresh
         </button>
       </div>
-
-      {(isOffline || isFromCache) && (
-        <FreshnessBanner
-          lastUpdated={
-            fetchedAt != null
-              ? new Date(fetchedAt).toISOString()
-              : report.generatedAt
-          }
-          source="cache"
-          isOffline={isOffline}
-          onRefresh={() => fetchCompatibilityReport()}
-        />
-      )}
-
-      {/* Registry Warning Banner */}
-      {registryWarnings.length > 0 && (
-        <div className="glass-panel p-4 border-l-4 border-[#F5A623]">
-          <div className="flex items-start gap-3">
-            <AlertTriangle size={20} className="text-[#F5A623] flex-shrink-0 mt-0.5" />
-            <div className="min-w-0">
-              <h4 className="font-semibold text-sm text-[#F5A623]">
-                Registry Metadata Incomplete
-              </h4>
-              <div className="mt-1 space-y-1">
-                {registryWarnings.map((w, i) => (
-                  <div key={i} className="text-sm text-gray-300">
-                    <span className="font-mono text-xs bg-white/10 px-1.5 py-0.5 rounded mr-1">
-                      {w.code}
-                    </span>
-                    {w.message}
-                  </div>
-                ))}
-              </div>
-              <p className="text-xs text-gray-500 mt-2">
-                Contract views are displaying with fallback data. Resolve the registry issue above to restore full functionality.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Overall Status */}
       <div className="glass-panel p-6">
@@ -350,7 +292,7 @@ export default function CompatibilityPanel() {
               </span>
             </div>
             <div className="space-y-1">
-              {sortIssues(report.criticalIssues).slice(0, 3).map((issue, index) => (
+              {report.criticalIssues.slice(0, 3).map((issue, index) => (
                 <div key={index} className="text-sm text-red-300">
                   - {issue.protocolName ?? issue.component}: {issue.issue}
                 </div>
@@ -460,14 +402,6 @@ export default function CompatibilityPanel() {
                           <span className="text-gray-400">{issue.component}</span>
                         </div>
                         <p className="text-sm text-gray-300 mt-0.5">{issue.issue}</p>
-                        {issue.fallbackReason && (
-                          <div className="flex items-center gap-1.5 mt-1.5">
-                            <span className="inline-flex items-center px-2 py-0.5 rounded bg-[#6C5DD3]/15 border border-[#6C5DD3]/30 text-[#A78BFA] text-xs font-medium">
-                              Fallback reason
-                            </span>
-                            <span className="text-xs text-gray-400">{issue.fallbackReason}</span>
-                          </div>
-                        )}
                         {issue.lastUpdated && (
                           <p className="text-xs text-gray-500 mt-1">
                             Updated {formatDate(issue.lastUpdated)}
@@ -530,11 +464,7 @@ export default function CompatibilityPanel() {
 
       {/* Protocol Status Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {stableSort(
-          report.protocols,
-          (a, b) => a.protocolName.localeCompare(b.protocolName),
-          (protocol) => protocol.protocolName,
-        ).map((protocol) => (
+        {report.protocols.map((protocol) => (
           <div
             key={protocol.protocolName}
             className={`glass-card p-4 cursor-pointer transition-all duration-200 ${
@@ -707,17 +637,6 @@ export default function CompatibilityPanel() {
 
                     <p className="text-gray-300 mb-2">{issue.issue}</p>
                     <p className="text-sm text-gray-400 mb-3">{issue.impact}</p>
-
-                    {issue.fallbackReason && (
-                      <div className="flex items-start gap-2 mb-3 p-2.5 rounded-lg bg-[#6C5DD3]/10 border border-[#6C5DD3]/25">
-                        <span
-                          className="flex-shrink-0 px-2 py-0.5 rounded text-xs font-semibold bg-[#6C5DD3]/20 text-[#A78BFA] border border-[#6C5DD3]/30"
-                        >
-                          Fallback reason
-                        </span>
-                        <span className="text-sm text-gray-300">{issue.fallbackReason}</span>
-                      </div>
-                    )}
 
                     <div className="border-t border-white/10 pt-3">
                       <p className="text-sm font-semibold mb-1 text-[#3EAC75]">Recommendation:</p>

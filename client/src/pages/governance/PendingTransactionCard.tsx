@@ -9,26 +9,20 @@ import {
   TX_PHASE_WALLET_ONLY,
 } from "../../services/transactionPhase";
 import type { PendingTransaction } from "./types";
-import type { GovernanceConfig } from "./types";
-import SignerQuorumProgress from "./SignerQuorumProgress";
-import { computeSignerQuorumProgress } from "./signerQuorum";
-import { getNetworkPassphrase } from "../../lib/networkEnv";
 
-const NETWORK_PASSPHRASE = getNetworkPassphrase();
+const NETWORK_PASSPHRASE =
+  import.meta.env.VITE_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 
 interface PendingTransactionCardProps {
   transaction: PendingTransaction;
   onSign: (txId: string, publicKey: string) => void;
   onExecute: (txId: string) => void;
-  /** Governance config used to render per-signer quorum progress (#1310). */
-  config?: Pick<GovernanceConfig, "signers">;
 }
 
 export default function PendingTransactionCard({
   transaction,
   onSign,
   onExecute,
-  config,
 }: PendingTransactionCardProps) {
   const { walletAddress } = useWallet();
   const [signing, setSigning] = useState(false);
@@ -48,9 +42,6 @@ export default function PendingTransactionCard({
   );
   const isReady = transaction.signatures.length >= transaction.threshold;
   const isExecuted = transaction.status === "executed";
-  const quorumProgress = computeSignerQuorumProgress(transaction, {
-    signers: config?.signers ?? [],
-  });
 
   async function handleSign() {
     if (!walletAddress) return;
@@ -152,8 +143,6 @@ export default function PendingTransactionCard({
           {statusLabel}
         </span>
       </div>
-
-      <SignerQuorumProgress progress={quorumProgress} />
 
       <div className="flex flex-wrap gap-2">
         {transaction.signatures.map((sig) => (

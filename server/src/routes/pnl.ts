@@ -6,7 +6,6 @@ import {
 } from "../services/pnl_engine";
 import { sendError } from "../utils/errorResponse";
 import { validateWalletAddress } from "../middleware/validation";
-import { safeWalletId } from "../utils/redact";
 
 type PnLPrismaClient = {
   userTransaction: {
@@ -108,7 +107,7 @@ pnlRouter.get("/:address/pnl", validateWalletAddress, async (req: Request, res: 
     const pnl = calculatePnL(transactions, priceHistory, currentPrice);
     res.json(pnl);
   } catch (error) {
-    console.error(`[pnl] Failed to calculate PnL for ${safeWalletId(address)}`, error);
+    console.error(`[pnl] Failed to calculate PnL for ${address}`, error);
     await prisma.$disconnect?.();
     sendError(res, 500, "PNL_CALCULATION_FAILED", "Failed to calculate PnL.");
   }

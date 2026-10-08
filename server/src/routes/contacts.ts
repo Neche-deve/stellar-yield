@@ -9,12 +9,6 @@
 import { Router, Request, Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
-import { safeWalletId } from "../utils/redact";
-import {
-  normalizeAddress,
-  reviewImportContacts,
-  type ImportContactReview,
-} from "../services/contactNormalization";
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -77,7 +71,7 @@ router.get("/", async (req: Request, res: Response) => {
       total: contacts.length,
     });
   } catch (error) {
-    console.error(`[contacts] Failed to fetch contacts for ${safeWalletId(walletAddress)}:`, error);
+    console.error("Failed to fetch contacts:", error);
     res.status(500).json({
       error: "Failed to fetch contacts",
       code: "FETCH_FAILED"
@@ -135,7 +129,7 @@ router.get("/search", async (req: Request, res: Response) => {
       total: contacts.length,
     });
   } catch (error) {
-    console.error(`[contacts] Failed to search contacts for ${safeWalletId(walletAddress)}:`, error);
+    console.error("Failed to search contacts:", error);
     res.status(500).json({
       error: "Failed to search contacts",
       code: "SEARCH_FAILED"
@@ -182,7 +176,7 @@ router.get("/export", async (req: Request, res: Response) => {
       encryptedBackup: JSON.stringify(backupData),
     });
   } catch (error) {
-    console.error(`[contacts] Failed to export contacts for ${safeWalletId(walletAddress)}:`, error);
+    console.error("Failed to export contacts:", error);
     res.status(500).json({
       error: "Failed to export contacts",
       code: "EXPORT_FAILED"
@@ -237,7 +231,7 @@ router.get("/:id", async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error(`[contacts] Failed to fetch contact:`, error);
+    console.error("Failed to fetch contact:", error);
     res.status(500).json({
       error: "Failed to fetch contact",
       code: "FETCH_FAILED"
@@ -311,7 +305,7 @@ router.post("/", async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error(`[contacts] Failed to create contact for ${safeWalletId(walletAddress)}:`, error);
+    console.error("Failed to create contact:", error);
 
     // Handle unique constraint violation
     if (error instanceof Error && error.message.includes('Unique constraint')) {
@@ -330,8 +324,7 @@ router.post("/", async (req: Request, res: Response) => {
 
 /**
  * POST /api/contacts/import
- * Import contacts from encrypted backup with duplicate detection
- * across nickname changes via address normalization.
+ * Import contacts from encrypted backup
  */
 router.post("/import", async (req: Request, res: Response) => {
   try {
@@ -363,63 +356,24 @@ router.post("/import", async (req: Request, res: Response) => {
       });
     }
 
-    // Fetch existing contacts for duplicate detection
-    const existingContacts = await prisma.contact.findMany({
-      where: { walletAddress },
-      select: {
-        id: true,
-        encryptedName: true,
-        encryptedAddress: true,
-      },
-    });
+    const importedContacts = [];
 
-    // Review import contacts for duplicates using address normalization
-    const reviews = reviewImportContacts(backupData.contacts, existingContacts);
+    for (const contactData of backupData.contacts) {
+      try {
+        // Check for duplicates
+        const existingContact = await prisma.contact.findFirst({
+          where: {
+            walletAddress,
+            encryptedAddress: contactData.encryptedAddress,
+          },
+        });
 
-    const importedContacts: ImportContactReview[] = [];
-    const skippedContacts: ImportContactReview[] = [];
-
-    for (const review of reviews) {
-      if (review.state === "duplicate") {
-        // Skip duplicate contacts (same address, same name)
-        skippedContacts.push(review);
-        continue;
-      }
-
-      if (review.state === "updated" && review.existingContactId) {
-        // Update existing contact with new encrypted data
-        try {
-          const contact = await prisma.contact.update({
-            where: { id: review.existingContactId },
-            data: {
-              encryptedName: review.encryptedName,
-              encryptedAddress: review.encryptedAddress,
-            },
-            select: {
-              id: true,
-              encryptedName: true,
-              encryptedAddress: true,
-              createdAt: true,
-              updatedAt: true,
-            },
-          });
-
-          importedContacts.push({
-            ...review,
-            encryptedName: contact.encryptedName,
-            encryptedAddress: contact.encryptedAddress,
-          });
-        } catch (error) {
-          console.error(`[contacts] Failed to update contact during import:`, error);
-        }
-      } else {
-        // Create new contact
-        try {
+        if (!existingContact) {
           const contact = await prisma.contact.create({
             data: {
               walletAddress,
-              encryptedName: review.encryptedName,
-              encryptedAddress: review.encryptedAddress,
+              encryptedName: contactData.encryptedName,
+              encryptedAddress: contactData.encryptedAddress,
             },
             select: {
               id: true,
@@ -431,35 +385,25 @@ router.post("/import", async (req: Request, res: Response) => {
           });
 
           importedContacts.push({
-            ...review,
-            encryptedName: contact.encryptedName,
-            encryptedAddress: contact.encryptedAddress,
+            id: contact.id,
+            encrypted_name: contact.encryptedName,
+            encrypted_address: contact.encryptedAddress,
+            created_at: contact.createdAt.toISOString(),
+            updated_at: contact.updatedAt.toISOString(),
           });
-        } catch (error) {
-          console.error(`[contacts] Failed to create contact during import:`, error);
         }
+      } catch (error) {
+        console.error("Failed to import contact:", error);
+        // Continue with other contacts
       }
     }
 
     res.json({
-      contacts: importedContacts.map((c) => ({
-        id: c.existingContactId ?? "new",
-        encrypted_name: c.encryptedName,
-        encrypted_address: c.encryptedAddress,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })),
+      contacts: importedContacts,
       total: importedContacts.length,
-      skipped: skippedContacts.length,
-      summary: {
-        total: reviews.length,
-        new: reviews.filter((r) => r.state === "new").length,
-        duplicate: reviews.filter((r) => r.state === "duplicate").length,
-        updated: reviews.filter((r) => r.state === "updated").length,
-      },
     });
   } catch (error) {
-    console.error(`[contacts] Failed to import contacts:`, error);
+    console.error("Failed to import contacts:", error);
     res.status(500).json({
       error: "Failed to import contacts",
       code: "IMPORT_FAILED"
@@ -550,7 +494,7 @@ router.put("/:id", async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error(`[contacts] Failed to update contact:`, error);
+    console.error("Failed to update contact:", error);
 
     // Handle unique constraint violation
     if (error instanceof Error && error.message.includes('Unique constraint')) {
@@ -601,7 +545,7 @@ router.delete("/:id", async (req: Request, res: Response) => {
 
     res.status(204).send();
   } catch (error) {
-    console.error(`[contacts] Failed to delete contact:`, error);
+    console.error("Failed to delete contact:", error);
     res.status(500).json({
       error: "Failed to delete contact",
       code: "DELETE_FAILED"

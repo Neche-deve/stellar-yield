@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Activity, ShieldCheck, ShieldAlert, ShieldX, Info } from 'lucide-react';
 import { useReducedMotion } from '../../hooks/useReducedMotion';
-import { stableSort } from '../../lib/stableSort';
 
 interface LiquidityHealth {
   strategyId: string;
@@ -90,16 +89,7 @@ export const LiquidityHealthDashboard: React.FC = () => {
       </div>
 
       <div className="divide-y divide-slate-100 dark:divide-slate-800">
-        {stableSort(
-          scores,
-          (a, b) => {
-            const severity = { critical: 0, warning: 1, healthy: 2 } as const;
-            const bySeverity = severity[a.status] - severity[b.status];
-            if (bySeverity !== 0) return bySeverity;
-            return b.score - a.score;
-          },
-          (s) => s.strategyId,
-        ).map((s) => (
+        {scores.map((s) => (
           <div key={s.strategyId} className="p-6 hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-3">

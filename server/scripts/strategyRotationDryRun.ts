@@ -17,16 +17,8 @@
  *   {
  *     "context": { currentId, currentScore, lastRotatedAt, candidates: [...] },
  *     "policy": { minScoreDifference, cooldownMs, maxDataAgeMs, minConfidence },
- *     "now": "2026-04-28T12:00:00Z",
- *     "currentStrategies": [
- *       { "id": "blend", "score": 5, "volatility": 2, "confidence": 0.9 }
- *     ]
+ *     "now": "2026-04-28T12:00:00Z"
  *   }
- *
- * `currentStrategies` is optional: when provided it is treated as the
- * previously-known strategy set so the diff can flag added, removed, and
- * re-weighted strategies relative to that snapshot. When omitted, the diff
- * only shows incumbent and threshold changes.
  */
 
 import { readFileSync } from "fs";

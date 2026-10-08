@@ -1,19 +1,5 @@
-import type {
-  ApiCachedGetOptions,
-  ApiCachedGetResult,
-  ApiCacheEntry,
-  ApiCacheStore,
-  ApiConfig,
-  ApiRequestOptions,
-  ApiVaultData,
-  HistoricalDataPoint,
-} from "../types";
-import {
-  ApiCancelledError,
-  ApiHttpError,
-  ApiNetworkError,
-  ApiTimeoutError,
-} from "../errors";
+import type { ApiConfig, ApiRequestOptions, ApiVaultData, HistoricalDataPoint } from "../types";
+import { ApiHttpError, ApiNetworkError, ApiTimeoutError } from "../errors";
 
 export interface ApiRegisteredEndpoint {
   method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
@@ -32,59 +18,13 @@ export interface YieldItem {
   risk?: string;
 }
 
-export interface DepositSimulationParams {
-  strategyId: string;
-  amount: number;
-  token: string;
-}
-
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 const DEFAULT_RETRYABLE_STATUSES = [408, 429, 500, 502, 503, 504];
-const DEFAULT_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-/**
- * Simple in-process cache store for environments without durable storage.
- * Suitable for tests and short-lived processes.
- */
-export function createMemoryCacheStore(): ApiCacheStore {
-  const map = new Map<string, string>();
-  return {
-    get<T>(key: string): ApiCacheEntry<T> | null {
-      const raw = map.get(key);
-      if (!raw) return null;
-      try {
-        return JSON.parse(raw) as ApiCacheEntry<T>;
-      } catch {
-        return null;
-      }
-    },
-    set<T>(key: string, entry: ApiCacheEntry<T>): void {
-      map.set(key, JSON.stringify(entry));
-    },
-  };
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(createAbortError());
-      return;
-    }
-    const timer = setTimeout(resolve, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(createAbortError());
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function createAbortError(): Error {
-  const err = new Error("The operation was aborted");
-  err.name = "AbortError";
-  return err;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isIdempotentMethod(method: string | undefined): boolean {
@@ -93,55 +33,12 @@ function isIdempotentMethod(method: string | undefined): boolean {
 }
 
 /**
- * Combines the client timeout with an optional caller AbortSignal.
- * Distinguishes timeout aborts from caller cancellation.
- */
-function createLinkedAbort(
-  timeoutMs: number,
-  external?: AbortSignal
-): { signal: AbortSignal; cleanup: () => void; wasCallerCancel: () => boolean } {
-  const controller = new AbortController();
-  let callerCancel = false;
-
-  const onExternal = () => {
-    callerCancel = true;
-    if (!controller.signal.aborted) {
-      controller.abort();
-    }
-  };
-
-  if (external) {
-    if (external.aborted) {
-      onExternal();
-    } else {
-      external.addEventListener("abort", onExternal, { once: true });
-    }
-  }
-
-  const timer = setTimeout(() => {
-    if (!controller.signal.aborted) {
-      controller.abort();
-    }
-  }, timeoutMs);
-
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      clearTimeout(timer);
-      external?.removeEventListener("abort", onExternal);
-    },
-    wasCallerCancel: () => callerCancel || Boolean(external?.aborted),
-  };
-}
-
-/**
  * ApiClient provides methods to interact with the StellarYield backend API.
  * Every endpoint maps directly to an entry in server/openapi.yaml.
  *
  * Transient failures (timeouts, network errors, retryable HTTP statuses) are
  * retried according to {@link ApiConfig}. Non-idempotent methods are only
- * retried when explicitly marked `retrySafe`. Caller AbortSignals cancel
- * without retries and surface {@link ApiCancelledError}.
+ * retried when explicitly marked `retrySafe`.
  */
 export class ApiClient {
   private config: ApiConfig;
@@ -169,18 +66,7 @@ export class ApiClient {
       { method: "POST", pathPattern: "/api/referrals/claim", description: "Claim referral rewards" },
       { method: "POST", pathPattern: "/api/zap/quote", description: "Get token swap quote" },
       { method: "GET", pathPattern: "/api/zap/supported-assets", description: "Get supported zap assets" },
-      {
-        method: "POST",
-        pathPattern: "/api/simulator/deposit",
-        description: "Simulate a deposit allocation preview",
-      },
     ];
-  }
-
-  private throwIfCancelled(path: string, signal?: AbortSignal): void {
-    if (signal?.aborted) {
-      throw new ApiCancelledError(path);
-    }
   }
 
   private async request<T>(
@@ -191,21 +77,17 @@ export class ApiClient {
     const method = options?.method ?? "GET";
     const mayRetry =
       isIdempotentMethod(method) || requestOptions?.retrySafe === true;
-    const externalSignal = requestOptions?.signal;
-
-    this.throwIfCancelled(path, externalSignal);
 
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      this.throwIfCancelled(path, externalSignal);
-
-      const linked = createLinkedAbort(this.timeoutMs, externalSignal);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
       try {
         const response = await fetch(`${this.config.baseUrl}${path}`, {
           ...options,
-          signal: linked.signal,
+          signal: controller.signal,
         });
 
         if (!response.ok) {
@@ -213,7 +95,7 @@ export class ApiClient {
           const err = new ApiHttpError(path, response.status, response.statusText, retryable);
           if (mayRetry && retryable && attempt < this.maxRetries) {
             lastError = err;
-            await sleep(this.retryDelayMs * Math.pow(2, attempt), externalSignal);
+            await sleep(this.retryDelayMs * Math.pow(2, attempt));
             continue;
           }
           throw err;
@@ -221,51 +103,28 @@ export class ApiClient {
 
         return (await response.json()) as T;
       } catch (err) {
-        if (err instanceof ApiHttpError || err instanceof ApiCancelledError) {
+        if (err instanceof ApiHttpError) {
           throw err;
         }
 
-        if (linked.wasCallerCancel() || externalSignal?.aborted) {
-          throw new ApiCancelledError(path);
-        }
-
-        const normalized = this.normalizeFetchError(path, err, linked.wasCallerCancel());
-        if (normalized instanceof ApiCancelledError) {
-          throw normalized;
-        }
+        const normalized = this.normalizeFetchError(path, err);
         if (mayRetry && normalized.retryable && attempt < this.maxRetries) {
           lastError = normalized;
-          try {
-            await sleep(this.retryDelayMs * Math.pow(2, attempt), externalSignal);
-          } catch {
-            throw new ApiCancelledError(path);
-          }
+          await sleep(this.retryDelayMs * Math.pow(2, attempt));
           continue;
         }
         throw normalized;
       } finally {
-        linked.cleanup();
+        clearTimeout(timer);
       }
     }
 
     throw lastError ?? new ApiNetworkError(path);
   }
 
-  private normalizeFetchError(
-    path: string,
-    err: unknown,
-    callerCancelled: boolean
-  ): ApiTimeoutError | ApiNetworkError | ApiCancelledError {
-    if (
-      err instanceof ApiTimeoutError ||
-      err instanceof ApiNetworkError ||
-      err instanceof ApiCancelledError
-    ) {
+  private normalizeFetchError(path: string, err: unknown): ApiTimeoutError | ApiNetworkError {
+    if (err instanceof ApiTimeoutError || err instanceof ApiNetworkError) {
       return err;
-    }
-
-    if (callerCancelled) {
-      return new ApiCancelledError(path);
     }
 
     const name = err instanceof Error ? err.name : "";
@@ -273,7 +132,6 @@ export class ApiClient {
 
     if (
       name === "AbortError" ||
-      name === "TimeoutError" ||
       message.includes("aborted") ||
       message.includes("timeout") ||
       message.includes("timed out")
@@ -284,55 +142,42 @@ export class ApiClient {
     return new ApiNetworkError(path, err);
   }
 
-  async getHealth(requestOptions?: ApiRequestOptions): Promise<{
-    database?: string;
-    redis?: string;
-    indexer?: string;
-    horizon?: string;
-  }> {
-    return this.request<{ database?: string; redis?: string; indexer?: string; horizon?: string }>(
-      "/api/health",
-      undefined,
-      requestOptions
-    );
+  async getHealth(): Promise<{ database?: string; redis?: string; indexer?: string; horizon?: string }> {
+    return this.request<{ database?: string; redis?: string; indexer?: string; horizon?: string }>("/api/health");
   }
 
-  async getYields(requestOptions?: ApiRequestOptions): Promise<YieldItem[]> {
-    return this.request<YieldItem[]>("/api/yields", undefined, requestOptions);
+  async getYields(): Promise<YieldItem[]> {
+    return this.request<YieldItem[]>("/api/yields");
   }
 
-  async getYieldHistory(requestOptions?: ApiRequestOptions): Promise<HistoricalDataPoint[]> {
-    return this.request<HistoricalDataPoint[]>("/api/yields/history", undefined, requestOptions);
+  async getYieldHistory(): Promise<HistoricalDataPoint[]> {
+    return this.request<HistoricalDataPoint[]>("/api/yields/history");
   }
 
-  async getCurrentAPY(vaultId: string, requestOptions?: ApiRequestOptions): Promise<number> {
-    const yields = await this.getYields(requestOptions);
+  async getCurrentAPY(vaultId: string): Promise<number> {
+    const yields = await this.getYields();
     const match = yields.find(
       (y) => (y.protocol || y.protocolName)?.toLowerCase() === vaultId.toLowerCase()
     );
     return match ? (match.apy ?? match.totalApy ?? 0) : 0;
   }
 
-  async getTVL(vaultId: string, requestOptions?: ApiRequestOptions): Promise<number> {
-    const yields = await this.getYields(requestOptions);
+  async getTVL(vaultId: string): Promise<number> {
+    const yields = await this.getYields();
     const match = yields.find(
       (y) => (y.protocol || y.protocolName)?.toLowerCase() === vaultId.toLowerCase()
     );
     return match ? (match.tvl ?? match.tvlUsd ?? 0) : 0;
   }
 
-  async getHistoricalData(
-    _vaultId: string,
-    _days: number = 30,
-    requestOptions?: ApiRequestOptions
-  ): Promise<HistoricalDataPoint[]> {
-    return this.getYieldHistory(requestOptions);
+  async getHistoricalData(_vaultId: string, _days: number = 30): Promise<HistoricalDataPoint[]> {
+    return this.getYieldHistory();
   }
 
-  async getVaultData(vaultId: string, requestOptions?: ApiRequestOptions): Promise<ApiVaultData> {
+  async getVaultData(vaultId: string): Promise<ApiVaultData> {
     const [apy, historicalData] = await Promise.all([
-      this.getCurrentAPY(vaultId, requestOptions),
-      this.getHistoricalData(vaultId, 30, requestOptions),
+      this.getCurrentAPY(vaultId),
+      this.getHistoricalData(vaultId, 30),
     ]);
 
     const latest = historicalData[historicalData.length - 1];
@@ -343,14 +188,11 @@ export class ApiClient {
     };
   }
 
-  async getPnL(walletAddress: string, requestOptions?: ApiRequestOptions): Promise<any> {
-    return this.request<any>(`/api/users/${walletAddress}/pnl`, undefined, requestOptions);
+  async getPnL(walletAddress: string): Promise<any> {
+    return this.request<any>(`/api/users/${walletAddress}/pnl`);
   }
 
-  async getLeaderboard(
-    params?: { metric?: string; timeframe?: string; limit?: number; offset?: number },
-    requestOptions?: ApiRequestOptions
-  ): Promise<any> {
+  async getLeaderboard(params?: { metric?: string; timeframe?: string; limit?: number; offset?: number }): Promise<any> {
     const query = new URLSearchParams();
     if (params?.metric) query.set("metric", params.metric);
     if (params?.timeframe) query.set("timeframe", params.timeframe);
@@ -358,40 +200,24 @@ export class ApiClient {
     if (params?.offset) query.set("offset", String(params.offset));
 
     const path = `/api/leaderboard${query.toString() ? `?${query.toString()}` : ""}`;
-    return this.request<any>(path, undefined, requestOptions);
+    return this.request<any>(path);
   }
 
-  async getReferrals(walletAddress: string, requestOptions?: ApiRequestOptions): Promise<any> {
-    return this.request<any>(`/api/referrals/${walletAddress}`, undefined, requestOptions);
+  async getReferrals(walletAddress: string): Promise<any> {
+    return this.request<any>(`/api/referrals/${walletAddress}`);
   }
 
-  async claimReferral(
-    address: string,
-    requestOptions?: ApiRequestOptions
-  ): Promise<{ amount: string; txHash: string }> {
+  async claimReferral(address: string): Promise<{ amount: string; txHash: string }> {
     // POST is non-idempotent — never retried unless callers opt in later.
-    return this.request<{ amount: string; txHash: string }>(
-      "/api/referrals/claim",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address }),
-      },
-      requestOptions
-    );
+    return this.request<{ amount: string; txHash: string }>("/api/referrals/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address }),
+    });
   }
 
-  /**
-   * Fetch a zap swap quote. Supports AbortSignal so clients can cancel after
-   * route changes or rapid input edits without applying a stale response.
-   */
-  async getZapQuote(
-    fromAsset: string,
-    toAsset: string,
-    amount: string,
-    requestOptions?: ApiRequestOptions
-  ): Promise<any> {
-    // Quote POST is safe to retry (read-only side effects) unless cancelled.
+  async getZapQuote(fromAsset: string, toAsset: string, amount: string): Promise<any> {
+    // Quote POST is safe to retry (read-only side effects).
     return this.request<any>(
       "/api/zap/quote",
       {
@@ -399,105 +225,11 @@ export class ApiClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fromAsset, toAsset, amount }),
       },
-      { retrySafe: requestOptions?.retrySafe ?? true, signal: requestOptions?.signal }
+      { retrySafe: true }
     );
   }
 
-  /**
-   * Run a deposit allocation simulation preview. Cancellable via AbortSignal.
-   */
-  async simulateDeposit(
-    params: DepositSimulationParams,
-    requestOptions?: ApiRequestOptions
-  ): Promise<any> {
-    return this.request<any>(
-      "/api/simulator/deposit",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params),
-      },
-      { retrySafe: requestOptions?.retrySafe ?? true, signal: requestOptions?.signal }
-    );
-  }
-
-  async getZapSupportedAssets(
-    requestOptions?: ApiRequestOptions
-  ): Promise<{ code: string; issuer?: string; name?: string }[]> {
-    return this.request<{ code: string; issuer?: string; name?: string }[]>(
-      "/api/zap/supported-assets",
-      undefined,
-      requestOptions
-    );
-  }
-
-  /**
-   * GET with offline cache fallback (#1125).
-   *
-   * Successful responses are written to `config.cacheStore`. When the
-   * network fails (or times out) a fresh-enough cached entry is returned
-   * with `fromCache: true` / `offline: true` so callers can render an
-   * explicit offline indicator. Fresh responses always replace the cached
-   * copy, so reconnecting automatically serves up-to-date data again.
-   *
-   * Requires `config.cacheStore`; without one this behaves like a plain
-   * GET that reports errors instead of throwing when possible.
-   * Caller cancellation ({@link ApiCancelledError}) still throws.
-   */
-  async cachedGet<T>(
-    path: string,
-    options?: ApiCachedGetOptions
-  ): Promise<ApiCachedGetResult<T>> {
-    const store = this.config.cacheStore;
-    const key = `sy_api_get:${options?.cacheKey ?? path}`;
-    const maxAgeMs = options?.maxAgeMs ?? DEFAULT_CACHE_MAX_AGE_MS;
-
-    const readCached = async (): Promise<ApiCacheEntry<T> | null> => {
-      if (!store) return null;
-      const entry = await store.get<T>(key);
-      if (!entry || typeof entry.fetchedAt !== "number") return null;
-      if (Date.now() - entry.fetchedAt > maxAgeMs) return null;
-      return entry;
-    };
-
-    const cached = await readCached();
-
-    try {
-      const data = await this.request<T>(path, undefined, options);
-      const fetchedAt = Date.now();
-      if (store) {
-        try {
-          await store.set(key, { data, fetchedAt });
-        } catch {
-          // Cache write failures must not fail the request.
-        }
-      }
-      return { data, fetchedAt, fromCache: false, offline: false, error: null };
-    } catch (err) {
-      if (err instanceof ApiCancelledError) {
-        throw err;
-      }
-
-      const offline =
-        err instanceof ApiNetworkError || err instanceof ApiTimeoutError;
-
-      if (cached) {
-        return {
-          data: cached.data,
-          fetchedAt: cached.fetchedAt,
-          fromCache: true,
-          offline,
-          error: null,
-        };
-      }
-
-      return {
-        data: null,
-        fetchedAt: null,
-        fromCache: false,
-        offline,
-        error: err instanceof Error ? err.message : "Request failed",
-      };
-    }
+  async getZapSupportedAssets(): Promise<{ code: string; issuer?: string; name?: string }[]> {
+    return this.request<{ code: string; issuer?: string; name?: string }[]>("/api/zap/supported-assets");
   }
 }

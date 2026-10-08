@@ -23,20 +23,11 @@ import {
   Maximize2,
 } from "lucide-react";
 import { apiUrl } from "../../lib/api";
-import { BackendUnavailable } from "../BackendUnavailable";
-import { stableSort } from "../../lib/stableSort";
-import EmptyState from "../common/EmptyState";
-import { EMPTY_STATE_APY } from "../../utils/emptyStateCopy";
 import { LiquidityBufferPanel } from "./LiquidityBufferPanel";
-import { FreshnessBanner } from "./FreshnessBanner";
 import { computeDecayedFreshnessConfidence } from "./freshnessDecay";
 import { RISK_EXPLANATIONS, RiskLevel } from "../../config/riskConfig";
-import { VaultRiskBadge } from "../common/VaultRiskBadge";
 import { useDensity } from "../../context/DensityContext";
 import type { DensityMode } from "../../context/DensityContext";
-import { cachedFetch } from "../../lib/cachedFetch";
-import { formatRewardRate } from "../../lib/apyFormat";
-import { getYieldSourceFreshness } from "./yieldSourceFreshness";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -70,7 +61,6 @@ interface ApyEntry {
   rewardTokens: string[];
   category: string;
   fetchedAt?: string;
-  isStale?: boolean;
   freshnessConfidence?: number;
   unusableDueToStale?: boolean;
 }
@@ -96,7 +86,6 @@ interface ApiApyEntry {
   rewardTokens?: unknown;
   category?: unknown;
   fetchedAt?: unknown;
-  isStale?: unknown;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -176,12 +165,17 @@ function normalizeApyEntry(entry: ApiApyEntry): ApyEntry {
         ? entry.category
         : deriveCategory(protocol),
     fetchedAt: normalizeFetchedAt(entry.fetchedAt),
-    isStale: typeof entry.isStale === "boolean" ? entry.isStale : undefined,
   };
 }
 
 function getErrorMessage(error: unknown): string {
-  return "Unable to fetch live APY data right now. The backend service may be disconnected.";
+  if (error instanceof Error && error.message) {
+    if (error.message.startsWith("HTTP")) {
+      return `Yield API request failed (${error.message})`;
+    }
+    return error.message;
+  }
+  return "Unable to fetch live APY data right now";
 }
 
 function getSortButtonLabel(
@@ -296,10 +290,6 @@ export default function ApyDashboard() {
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [selectedCategory, setSelectedCategory] = useState<string>("All");
   const [refreshing, setRefreshing] = useState(false);
-  const [cacheIndicator, setCacheIndicator] = useState<
-    "offline" | "cached" | null
-  >(null);
-  const [cacheFetchedAt, setCacheFetchedAt] = useState<number | null>(null);
   const { startRequest, isCurrent } = useStaleResponseGuard();
 
   const fetchApyData = useCallback(async (showLoadingState = true) => {
@@ -311,45 +301,30 @@ export default function ApyDashboard() {
 
     try {
       setError(null);
-      const result = await cachedFetch<unknown>(apiUrl("/api/yields"));
+      const res = await fetch(apiUrl("/api/yields"));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: unknown = await res.json();
       if (!isCurrent(token)) return;
-      if (result.data == null) {
-        setError(
-          result.error
-            ? getErrorMessage(new Error(result.error))
-            : "Unable to fetch live APY data right now",
+      const rows = Array.isArray(data) ? data : [];
+      const augmented: ApyEntry[] = rows.map((row) => {
+        const entry = normalizeApyEntry(row as ApiApyEntry);
+        const fetchedTime = entry.fetchedAt
+          ? new Date(entry.fetchedAt).getTime()
+          : Date.now();
+        const freshness = computeDecayedFreshnessConfidence(
+          Date.now() - fetchedTime,
         );
-        setApyData([]);
-        setCacheIndicator(null);
-        setCacheFetchedAt(null);
-      } else {
-        const rows = Array.isArray(result.data) ? result.data : [];
-        const augmented: ApyEntry[] = rows.map((row) => {
-          const entry = normalizeApyEntry(row as ApiApyEntry);
-          const fetchedTime = entry.fetchedAt
-            ? Date.parse(entry.fetchedAt)
-            : Date.now();
-          const freshness = computeDecayedFreshnessConfidence(
-            Date.now() - fetchedTime,
-          );
-          return {
-            ...entry,
-            freshnessConfidence: freshness.confidence,
-            unusableDueToStale: freshness.unusable,
-          };
-        });
-        setApyData(augmented);
-        setCacheIndicator(
-          result.offline ? "offline" : result.fromCache ? "cached" : null,
-        );
-        setCacheFetchedAt(result.fetchedAt);
-        setError(null);
-      }
+        return {
+          ...entry,
+          freshnessConfidence: freshness.confidence,
+          unusableDueToStale: freshness.unusable,
+        };
+      });
+      setApyData(augmented);
     } catch (err) {
       if (!isCurrent(token)) return;
       setError(getErrorMessage(err));
       setApyData([]);
-      setCacheIndicator(null);
     } finally {
       if (isCurrent(token)) {
         setLoading(false);
@@ -362,15 +337,6 @@ export default function ApyDashboard() {
     void fetchApyData();
   }, [fetchApyData]);
 
-  // Auto-refresh cached rates when connectivity returns (#1125).
-  useEffect(() => {
-    const handleOnline = () => {
-      void fetchApyData(false);
-    };
-    window.addEventListener("online", handleOnline);
-    return () => window.removeEventListener("online", handleOnline);
-  }, [fetchApyData]);
-
   const handleRefresh = () => {
     setRefreshing(true);
     void fetchApyData(false);
@@ -378,19 +344,10 @@ export default function ApyDashboard() {
 
   // ── Derived state ───────────────────────────────────────────────────
 
-  const categories = [
-    "All",
-    ...Array.from(new Set(apyData.map((d) => d.category))).sort((a, b) =>
-      a.localeCompare(b),
-    ),
-  ];
+  const categories = ["All", ...new Set(apyData.map((d) => d.category))];
 
-  // Deterministic ordering (#1118): primary key first, then a final
-  // direction-independent tiebreak on the unique protocol-asset row id so
-  // equal-value rows keep the same order across refreshes regardless of
-  // backend response order.
-  const filtered = stableSort(
-    apyData.filter((d) => {
+  const filtered = apyData
+    .filter((d) => {
       if (d.unusableDueToStale) return false;
       const q = searchQuery.toLowerCase();
       const matchesSearch =
@@ -400,8 +357,8 @@ export default function ApyDashboard() {
       const matchesCategory =
         selectedCategory === "All" || d.category === selectedCategory;
       return matchesSearch && matchesCategory;
-    }),
-    (a, b) => {
+    })
+    .sort((a, b) => {
       const dir = sortDirection === "asc" ? 1 : -1;
       if (sortField === "protocol")
         return dir * a.protocol.localeCompare(b.protocol);
@@ -414,9 +371,7 @@ export default function ApyDashboard() {
       const scoreA = (a[sortField] as number) * (a.freshnessConfidence ?? 1);
       const scoreB = (b[sortField] as number) * (b.freshnessConfidence ?? 1);
       return dir * (scoreA - scoreB);
-    },
-    getApyRowId,
-  );
+    });
 
   const bestApy = apyData.length
     ? Math.max(...apyData.map((d) => d.netApy ?? d.apy))
@@ -426,22 +381,17 @@ export default function ApyDashboard() {
     : 0;
   const totalTvl = apyData.reduce((s, d) => s + d.tvl, 0);
   const protocolCount = new Set(apyData.map((d) => d.protocol)).size;
-  const feeAttributionRows = stableSort(
-    apyData.map((entry) => ({
-      id: getApyRowId(entry),
-      vault: entry.protocol,
-      totalFeeDragApy:
-        entry.feeAttribution?.totalFeeDragApy ?? entry.feeDragApy ?? 0,
-      managementFeeApy: entry.feeAttribution?.managementFeeApy ?? 0,
-      protocolFeeApy: entry.feeAttribution?.protocolFeeApy ?? 0,
-      slippageApy: entry.feeAttribution?.slippageApy ?? 0,
-      networkFeeApy: entry.feeAttribution?.networkFeeApy ?? 0,
-      rewardOffsetApy: entry.feeAttribution?.rewardOffsetApy ?? 0,
-      unknownFeeApy: entry.feeAttribution?.unknownFeeApy ?? 0,
-    })),
-    (a, b) => a.vault.localeCompare(b.vault),
-    (row) => row.id,
-  );
+  const feeAttributionRows = apyData.map((entry) => ({
+    vault: entry.protocol,
+    totalFeeDragApy:
+      entry.feeAttribution?.totalFeeDragApy ?? entry.feeDragApy ?? 0,
+    managementFeeApy: entry.feeAttribution?.managementFeeApy ?? 0,
+    protocolFeeApy: entry.feeAttribution?.protocolFeeApy ?? 0,
+    slippageApy: entry.feeAttribution?.slippageApy ?? 0,
+    networkFeeApy: entry.feeAttribution?.networkFeeApy ?? 0,
+    rewardOffsetApy: entry.feeAttribution?.rewardOffsetApy ?? 0,
+    unknownFeeApy: entry.feeAttribution?.unknownFeeApy ?? 0,
+  }));
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -477,11 +427,21 @@ export default function ApyDashboard() {
             Compare yields across Stellar DeFi protocols
           </p>
         </header>
-        <BackendUnavailable
-          featureName="APY Data"
-          reason="The backend service is currently disconnected or unavailable. Please try again later."
-          onRetry={handleRefresh}
-        />
+        <div className="glass-panel p-12 text-center">
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-red-500/10 mb-6">
+            <AlertTriangle size={32} className="text-[#FF5E5E]" />
+          </div>
+          <h3 className="text-xl font-bold mb-2">Failed to Load APY Data</h3>
+          <p className="text-gray-400 max-w-md mx-auto mb-6">
+            {error}. Please try again.
+          </p>
+          <button
+            onClick={handleRefresh}
+            className="btn-primary inline-flex items-center gap-2"
+          >
+            <RefreshCw size={16} /> Retry
+          </button>
+        </div>
       </div>
     );
   }
@@ -519,19 +479,6 @@ export default function ApyDashboard() {
           {refreshing ? "Refreshing..." : "Refresh Rates"}
         </button>
       </header>
-
-      {cacheIndicator && apyData.length > 0 && (
-        <FreshnessBanner
-          lastUpdated={
-            cacheFetchedAt != null
-              ? new Date(cacheFetchedAt).toISOString()
-              : undefined
-          }
-          source="cache"
-          isOffline={cacheIndicator === "offline"}
-          onRefresh={handleRefresh}
-        />
-      )}
 
       {error && (
         <div
@@ -572,7 +519,7 @@ export default function ApyDashboard() {
               <Flame size={14} /> Best APY
             </div>
             <p className="text-2xl font-bold text-[#3EAC75]">
-              {formatRewardRate(bestApy)}
+              {bestApy.toFixed(2)}%
             </p>
             <p className="text-xs text-gray-500 mt-1">
               Net after fees/slippage
@@ -582,7 +529,7 @@ export default function ApyDashboard() {
             <div className="flex items-center gap-2 text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">
               <TrendingUp size={14} /> Avg APY
             </div>
-            <p className="text-2xl font-bold">{formatRewardRate(avgApy)}</p>
+            <p className="text-2xl font-bold">{avgApy.toFixed(2)}%</p>
             <p className="text-xs text-gray-500 mt-1">
               Portfolio net APY average
             </p>
@@ -638,29 +585,29 @@ export default function ApyDashboard() {
               </thead>
               <tbody>
                 {feeAttributionRows.map((row) => (
-                  <tr key={row.id} className="border-t border-white/10">
+                  <tr key={row.vault} className="border-t border-white/10">
                     <td className="py-2">{row.vault}</td>
                     <td className="py-2 text-right text-red-300">
-                      {formatRewardRate(row.totalFeeDragApy)}
+                      {row.totalFeeDragApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right">
-                      {formatRewardRate(row.managementFeeApy)}
+                      {row.managementFeeApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right">
-                      {formatRewardRate(row.protocolFeeApy)}
+                      {row.protocolFeeApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right">
-                      {formatRewardRate(row.slippageApy)}
+                      {row.slippageApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right">
-                      {formatRewardRate(row.networkFeeApy)}
+                      {row.networkFeeApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right text-green-300">
-                      -{formatRewardRate(row.rewardOffsetApy)}
+                      -{row.rewardOffsetApy.toFixed(2)}%
                     </td>
                     <td className="py-2 text-right">
                       {row.unknownFeeApy > 0
-                        ? formatRewardRate(row.unknownFeeApy)
+                        ? `${row.unknownFeeApy.toFixed(2)}%`
                         : "Unknown / None"}
                     </td>
                   </tr>
@@ -764,12 +711,21 @@ export default function ApyDashboard() {
           {loading
             ? Array.from({ length: 8 }).map((_, i) => <SkeletonCard key={i} />)
             : filtered.map((entry, i) => {
+                const risk =
+                  RISK_EXPLANATIONS[entry.risk as RiskLevel] ??
+                  RISK_EXPLANATIONS.Medium;
                 const gradient =
                   PROTOCOL_COLORS[entry.protocol] ??
                   "from-gray-500/80 to-gray-600/80";
                 const isPositive = entry.change24h >= 0;
 
-                const freshness = getYieldSourceFreshness(entry);
+                const fetchedTime = entry.fetchedAt
+                  ? new Date(entry.fetchedAt)
+                  : new Date();
+                const diffMins = Math.floor(
+                  (Date.now() - fetchedTime.getTime()) / 60000,
+                );
+                const isStale = (entry.freshnessConfidence ?? 1) < 0.5;
 
                 return (
                   <div
@@ -795,31 +751,46 @@ export default function ApyDashboard() {
                             {entry.category}
                           </p>
                         </div>
-                        <VaultRiskBadge
-                          risk={entry.risk}
-                          id={`grid-${getApyRowId(entry)}`}
-                        />
+                        <button
+                          type="button"
+                          className="group/risk relative flex cursor-help outline-none"
+                          aria-describedby={`risk-tip-grid-${getApyRowId(entry)}`}
+                          aria-label={`${entry.protocol} ${entry.asset} risk: ${entry.risk}. ${risk.explanation}`}
+                        >
+                          <span
+                            className={`${risk.bg} ${risk.color} ${risk.border} border px-2 py-0.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center gap-1`}
+                          >
+                            {entry.risk} <Info size={10} aria-hidden="true" />
+                          </span>
+                          <span
+                            id={`risk-tip-grid-${getApyRowId(entry)}`}
+                            role="tooltip"
+                            className="absolute hidden group-hover/risk:block group-focus-within/risk:block bottom-full mb-2 right-0 w-48 p-2 bg-[#1A1A24] border border-white/10 rounded-lg text-xs leading-relaxed text-gray-300 shadow-xl z-10 transition-opacity"
+                          >
+                            {risk.explanation}
+                          </span>
+                        </button>
                       </div>
 
                       {/* Freshness Indicator */}
                       <div className="flex items-center gap-1.5 mb-3 text-[10px] font-medium uppercase tracking-wider">
-                        {freshness.status === "stale" ? (
+                        {isStale ? (
                           <span
                             className="text-red-400 flex items-center gap-1 bg-red-400/10 px-2 py-0.5 rounded-full"
-                            aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${freshness.ageMinutes} minutes ago`}
+                            aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${diffMins} minutes ago`}
                           >
-                            <Clock size={10} aria-hidden="true" /> Stale Data ({freshness.ageMinutes}m old)
-                          </span>
-                        ) : freshness.status === "fresh" ? (
-                          <span
-                            className="text-gray-500 flex items-center gap-1"
-                            aria-label={`APY data for ${entry.protocol} ${entry.asset} updated ${freshness.ageMinutes} minutes ago`}
-                          >
-                            <Clock size={10} aria-hidden="true" /> Updated {freshness.ageMinutes}m ago
+                            <Clock size={10} aria-hidden="true" /> Stale Data (
+                            {diffMins}m old)
                           </span>
                         ) : (
-                          <span className="text-amber-300 flex items-center gap-1 bg-amber-300/10 px-2 py-0.5 rounded-full" role="status">
-                            <Clock size={10} aria-hidden="true" /> Freshness unavailable
+                          <span
+                            className="text-gray-500 flex items-center gap-1"
+                            aria-label={`Updated just now, ${Math.round((entry.freshnessConfidence ?? 1) * 100)} percent confidence`}
+                          >
+                            <Clock size={10} aria-hidden="true" /> Updated just
+                            now (
+                            {Math.round((entry.freshnessConfidence ?? 1) * 100)}
+                            % confidence)
                           </span>
                         )}
                       </div>
@@ -834,7 +805,7 @@ export default function ApyDashboard() {
                       {/* APY */}
                       <div className="flex items-baseline gap-2 mb-1">
                         <span className="text-3xl font-extrabold text-white">
-                          {formatRewardRate(entry.netApy ?? entry.apy, { suffix: false })}
+                          {(entry.netApy ?? entry.apy).toFixed(2)}
                         </span>
                         <span className="text-lg font-bold text-gray-400">
                           % APY
@@ -842,8 +813,8 @@ export default function ApyDashboard() {
                       </div>
                       <p className="text-xs text-gray-500 flex items-center gap-1.5">
                         <span>
-                          Gross {formatRewardRate(entry.totalApy ?? entry.apy)} |
-                          Drag {formatRewardRate(entry.feeDragApy ?? 0)}
+                          Gross {(entry.totalApy ?? entry.apy).toFixed(2)}% |
+                          Drag {(entry.feeDragApy ?? 0).toFixed(2)}%
                         </span>
                         <button
                           onClick={() => setIsFeeModalOpen(true)}
@@ -864,7 +835,8 @@ export default function ApyDashboard() {
                           ) : (
                             <ArrowDownRight size={12} />
                           )}
-                          {formatRewardRate(entry.change24h, { showPositiveSign: true })} 24h
+                          {isPositive ? "+" : ""}
+                          {entry.change24h.toFixed(2)}% 24h
                         </span>
                         <span className="text-gray-500">
                           TVL {formatTvl(entry.tvl)}
@@ -897,7 +869,7 @@ export default function ApyDashboard() {
                           {entry.netYieldSensitivity
                             .map(
                               (s) =>
-                                `${s.environment[0].toUpperCase()}:${formatRewardRate(s.netApy)}`,
+                                `${s.environment[0].toUpperCase()}:${s.netApy.toFixed(1)}%`,
                             )
                             .join(" ")}
                         </div>
@@ -916,20 +888,25 @@ export default function ApyDashboard() {
 
       {!loading && apyData.length === 0 && (
         <div
-          className="glass-panel p-16"
+          className="glass-panel p-16 text-center"
           data-testid="apy-empty-state"
         >
-          <EmptyState
-            icon={<AlertTriangle size={32} className="text-gray-500" />}
-            title={EMPTY_STATE_APY.title}
-            description={EMPTY_STATE_APY.description}
-            action={{
-              label: refreshing ? "Refreshing…" : "Refresh",
-              onClick: handleRefresh,
-              loading: refreshing && !reducedMotion,
-            }}
-            testId="apy-empty-state-content"
-          />
+          <AlertTriangle size={32} className="text-gray-500 mx-auto mb-4" />
+          <p className="text-gray-300 font-medium">No APY data yet</p>
+          <p className="text-gray-500 text-sm mt-1">
+            New rates will appear here as protocols report yields. Refresh to
+            check again.
+          </p>
+          <button
+            onClick={handleRefresh}
+            className="btn-secondary inline-flex items-center gap-2 mt-6"
+          >
+            <RefreshCw
+              size={14}
+              className={refreshing && !reducedMotion ? "animate-spin" : ""}
+            />
+            Refresh
+          </button>
         </div>
       )}
 
@@ -1027,12 +1004,21 @@ export default function ApyDashboard() {
                       <SkeletonTableRow key={i} />
                     ))
                   : filtered.map((entry, i) => {
+                      const risk =
+                        RISK_EXPLANATIONS[entry.risk as RiskLevel] ??
+                        RISK_EXPLANATIONS.Medium;
                       const gradient =
                         PROTOCOL_COLORS[entry.protocol] ??
                         "from-gray-500/80 to-gray-600/80";
                       const isPositive = entry.change24h >= 0;
 
-                      const freshness = getYieldSourceFreshness(entry);
+                      const fetchedTime = entry.fetchedAt
+                        ? new Date(entry.fetchedAt)
+                        : new Date();
+                      const diffMins = Math.floor(
+                        (Date.now() - fetchedTime.getTime()) / 60000,
+                      );
+                      const isStale = diffMins > 5;
 
                       return (
                         <tr
@@ -1059,17 +1045,12 @@ export default function ApyDashboard() {
                                   <p className="text-[10px] text-gray-500">
                                     {entry.category}
                                   </p>
-                                  {freshness.status === "stale" && (
+                                  {isStale && (
                                     <span
                                       className="text-[9px] text-red-400 bg-red-400/10 px-1.5 py-px rounded uppercase"
-                                      aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${freshness.ageMinutes} minutes ago`}
+                                      aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${diffMins} minutes ago`}
                                     >
                                       Stale
-                                    </span>
-                                  )}
-                                  {freshness.status === "unknown" && (
-                                    <span className="text-[9px] text-amber-300 bg-amber-300/10 px-1.5 py-px rounded uppercase" role="status">
-                                      Freshness unknown
                                     </span>
                                   )}
                                 </div>
@@ -1083,10 +1064,10 @@ export default function ApyDashboard() {
                           </td>
                           <td className="px-6 py-5">
                             <span className="text-green-400 font-extrabold text-lg">
-                              {formatRewardRate(entry.netApy ?? entry.apy)}
+                              {(entry.netApy ?? entry.apy).toFixed(2)}%
                             </span>
                             <p className="text-[10px] text-gray-500">
-                              Gross {formatRewardRate(entry.totalApy ?? entry.apy)}
+                              Gross {(entry.totalApy ?? entry.apy).toFixed(2)}%
                             </p>
                           </td>
                           <td className="px-6 py-5">
@@ -1098,17 +1079,34 @@ export default function ApyDashboard() {
                               ) : (
                                 <ArrowDownRight size={14} />
                               )}
-                              {formatRewardRate(entry.change24h, { showPositiveSign: true })}
+                              {isPositive ? "+" : ""}
+                              {entry.change24h.toFixed(2)}%
                             </span>
                           </td>
                           <td className="px-6 py-5 text-gray-300 font-medium">
                             {formatTvl(entry.tvl)}
                           </td>
                           <td className="px-6 py-5">
-                            <VaultRiskBadge
-                              risk={entry.risk}
-                              id={`table-${getApyRowId(entry)}`}
-                            />
+                            <button
+                              type="button"
+                              className="group/risk relative inline-flex cursor-help outline-none"
+                              aria-describedby={`risk-tip-table-${getApyRowId(entry)}`}
+                              aria-label={`${entry.protocol} ${entry.asset} risk: ${entry.risk}. ${risk.explanation}`}
+                            >
+                              <span
+                                className={`${risk.bg} ${risk.color} ${risk.border} border px-2.5 py-1.5 rounded text-xs font-bold uppercase tracking-wider flex items-center gap-1`}
+                              >
+                                {entry.risk}{" "}
+                                <Info size={12} aria-hidden="true" />
+                              </span>
+                              <span
+                                id={`risk-tip-table-${getApyRowId(entry)}`}
+                                role="tooltip"
+                                className="absolute hidden group-hover/risk:block group-focus-within/risk:block bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-[#1A1A24] border border-white/10 rounded-lg text-xs leading-relaxed text-gray-300 shadow-xl z-10 transition-opacity"
+                              >
+                                {risk.explanation}
+                              </span>
+                            </button>
                           </td>
                           <td className="px-6 py-5 text-right">
                             {entry.capitalEfficiency && (

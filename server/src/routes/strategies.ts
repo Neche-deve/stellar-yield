@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { PROTOCOLS } from "../config/protocols";
-import { calculateRiskScore, explainRiskScore } from "../utils/riskScoring";
+import { calculateRiskScore } from "../utils/riskScoring";
 import {
   rankStrategies,
   filterByTimeWindow,
@@ -15,7 +15,6 @@ import {
 import { yieldReliabilityEngine } from "../services/yieldReliabilityService";
 import { rotationRegistry } from "../services/strategyRotationService";
 import { exportService } from "../services/exportService";
-import { sendExportError, sendError } from "../utils/errorResponse";
 import { strategySnapshotVersioningService } from "../services/strategySnapshotVersioningService";
 import { strategyLifecycleAuditService } from "../services/strategyLifecycleAuditService";
 
@@ -195,7 +194,7 @@ router.get("/export", async (req: Request, res: Response) => {
     res.json(bundle);
   } catch (error) {
     console.error("Export failed:", error);
-    sendExportError(res, error);
+    res.status(500).json({ error: "Failed to generate export bundle" });
   }
 });
 
@@ -210,7 +209,7 @@ router.get("/export/preview", async (req: Request, res: Response) => {
     res.json(metadata);
   } catch (error) {
     console.error("Export preview failed:", error);
-    sendExportError(res, error);
+    res.status(500).json({ error: "Failed to generate export preview" });
   }
 });
 
@@ -292,38 +291,6 @@ router.get("/:strategyId/lifecycle", (req: Request, res: Response) => {
     path: events.map((e) => e.type),
     isTraceable: strategyLifecycleAuditService.isTraceable(strategyId),
     total: events.length,
-  });
-});
-
-/**
- * GET /api/strategies/:strategyId/risk-explanation
- *
- * #1416 — Human-readable metadata for a strategy's risk score: which
- * factors (TVL, IL volatility, protocol age) are driving it up or down,
- * and a one-sentence plain-language reason for each, alongside the
- * existing numeric score/breakdown.
- */
-router.get("/:strategyId/risk-explanation", (req: Request, res: Response) => {
-  const { strategyId } = req.params;
-  const protocol = PROTOCOLS.find((p) => p.protocolName.toLowerCase() === strategyId.toLowerCase());
-
-  if (!protocol) {
-    sendError(res, 404, "STRATEGY_NOT_FOUND", `No strategy found with id "${strategyId}"`, undefined, undefined, false);
-    return;
-  }
-
-  const input = {
-    tvlUsd: protocol.baseTvlUsd,
-    ilVolatilityPct: protocol.volatilityPct,
-    protocolAgeDays: protocol.protocolAgeDays,
-  };
-  const result = calculateRiskScore(input);
-  const explanation = explainRiskScore(result, input);
-
-  res.json({
-    strategyId: protocol.protocolName.toLowerCase(),
-    ...explanation,
-    breakdown: result.breakdown,
   });
 });
 

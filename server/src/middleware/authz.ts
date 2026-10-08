@@ -1,5 +1,4 @@
 import { Request, Response, NextFunction } from "express";
-import { errorEnvelope } from "../types/envelope";
 
 /**
  * Shared route-level authorization policy for sensitive endpoints
@@ -13,19 +12,17 @@ export function requireRole(...allowedRoles: string[]) {
       | { role?: string }
       | undefined;
 
-    const route = req.baseUrl || req.path || "authz";
-
     if (!user) {
-      res.status(401).json(
-        errorEnvelope("UNAUTHORIZED", "Unauthorized: authentication required", route),
-      );
+      res.status(401).json({
+        error: "Unauthorized: authentication required",
+      });
       return;
     }
 
     if (!user.role || !allowedRoles.includes(user.role)) {
-      res.status(403).json(
-        errorEnvelope("FORBIDDEN", "Unauthorized: Admin access required", route),
-      );
+      res.status(403).json({
+        error: "Unauthorized: Admin access required",
+      });
       return;
     }
 
@@ -34,4 +31,3 @@ export function requireRole(...allowedRoles: string[]) {
 }
 
 export const requireAdmin = requireRole("ADMIN");
-

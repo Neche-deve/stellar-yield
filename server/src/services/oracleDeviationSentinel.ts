@@ -13,11 +13,6 @@
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-
-// Static import: oracleDeviationGrouper only imports *types* from this
-// module, so there's no runtime cycle.
-import { groupOracleDeviations } from "./oracleDeviationGrouper";
-
 export type OracleState = "FRESH" | "STALE" | "VALID" | "DEVIATED" | "MISSING";
 export type ExecutionDecision = "ALLOW" | "DOWNGRADE" | "BLOCK";
 
@@ -206,13 +201,4 @@ export function getDeviationLog(): DeviationEvent[] {
 export function clearDeviationLog(): void {
   _log.length = 0;
   _eventCounter = 0;
-}
-
-// ─── Grouped view (#1093) ────────────────────────────────────────────────────
-
-/**
- * Return deviation events grouped by asset + severity band.
- */
-export function getGroupedDeviations(): import("./driftAnomalyGrouper").GroupedAnomaly[] {
-  return groupOracleDeviations(getDeviationLog());
 }

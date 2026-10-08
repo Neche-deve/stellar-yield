@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "fs";
-import * as child_process from "child_process";
+import { execSync } from "child_process";
 import {
   checkNodeVersion,
   checkRust,
@@ -9,6 +9,19 @@ import {
   checkNetworkReachability,
   parseEnvFile,
 } from "../../../scripts/validate-workspace.js";
+
+vi.mock("fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("fs")>();
+  return {
+    ...actual,
+    existsSync: vi.fn(),
+    readFileSync: vi.fn(),
+  };
+});
+
+vi.mock("child_process", () => ({
+  execSync: vi.fn(),
+}));
 
 describe("Workspace Validator Script Checks", () => {
   beforeEach(() => {
@@ -65,17 +78,17 @@ describe("Workspace Validator Script Checks", () => {
 
   describe("checkRust", () => {
     it("passes when rustc and cargo versions are fetched successfully", () => {
-      const mockExec = vi.fn().mockReturnValue(Buffer.from("rustc 1.70.0 (90c541806 2023-05-31)"));
-      const result = checkRust(mockExec as any);
+      vi.mocked(execSync).mockReturnValue(Buffer.from("rustc 1.70.0 (90c541806 2023-05-31)"));
+      const result = checkRust();
       expect(result.success).toBe(true);
       expect(result.message).toContain("rustc");
     });
 
     it("fails when rustc or cargo are missing", () => {
-      const mockExec = vi.fn().mockImplementation(() => {
+      vi.mocked(execSync).mockImplementation(() => {
         throw new Error("command not found");
       });
-      const result = checkRust(mockExec as any);
+      const result = checkRust();
       expect(result.success).toBe(false);
       expect(result.message).toContain("Rust or Cargo compiler not found");
     });
@@ -83,14 +96,14 @@ describe("Workspace Validator Script Checks", () => {
 
   describe("checkWorkspaceDependencies", () => {
     it("passes when node_modules exists in all workspaces", () => {
-      vi.spyOn(fs, "existsSync").mockReturnValue(true);
+      vi.mocked(fs.existsSync).mockReturnValue(true);
       const result = checkWorkspaceDependencies();
       expect(result.success).toBe(true);
     });
 
     it("fails when any node_modules is missing", () => {
       // Mock existsSync to return false (missing dependencies)
-      vi.spyOn(fs, "existsSync").mockReturnValue(false);
+      vi.mocked(fs.existsSync).mockReturnValue(false);
       const result = checkWorkspaceDependencies();
       expect(result.success).toBe(false);
       expect(result.message).toContain("Dependencies are missing in");
@@ -99,13 +112,13 @@ describe("Workspace Validator Script Checks", () => {
 
   describe("checkEnvFiles", () => {
     it("passes when env files exist", () => {
-      vi.spyOn(fs, "existsSync").mockReturnValue(true);
+      vi.mocked(fs.existsSync).mockReturnValue(true);
       const result = checkEnvFiles();
       expect(result.success).toBe(true);
     });
 
     it("fails when client env.local or server env is missing", () => {
-      vi.spyOn(fs, "existsSync").mockReturnValue(false);
+      vi.mocked(fs.existsSync).mockReturnValue(false);
       const result = checkEnvFiles();
       expect(result.success).toBe(false);
       expect(result.message).toContain("missing");
@@ -114,8 +127,8 @@ describe("Workspace Validator Script Checks", () => {
 
   describe("parseEnvFile", () => {
     it("correctly parses key-value pairs", () => {
-      vi.spyOn(fs, "existsSync").mockReturnValue(true);
-      vi.spyOn(fs, "readFileSync").mockReturnValue(
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockReturnValue(
         "VITE_API_BASE_URL=http://localhost:3001\n# Comment\nVITE_SOROBAN_RPC_URL=\"https://soroban-testnet.stellar.org\"\n"
       );
 

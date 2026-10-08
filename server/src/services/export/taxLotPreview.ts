@@ -9,8 +9,7 @@
  * tax-incomplete.
  */
 
-import type { TransactionRecord, CsvAuditResult } from "./csvGenerator";
-import { auditCsvRows } from "./csvGenerator";
+import type { TransactionRecord } from "./csvGenerator";
 
 export type RawTaxAction = "DEPOSIT" | "WITHDRAWAL" | "HARVEST" | string;
 
@@ -66,7 +65,6 @@ export interface TaxLotPreview {
    * client should only enable the download button when this is `true`.
    */
   canDownload: boolean;
-  audit: CsvAuditResult;
 }
 
 const DEFAULT_SUPPORTED_TOKENS = new Set(["USDC"]);
@@ -184,7 +182,7 @@ export function buildTaxLotPreview(
     });
   });
 
-  const preview: TaxLotPreview = {
+  return {
     rows,
     warnings,
     totals: {
@@ -193,11 +191,7 @@ export function buildTaxLotPreview(
       rows: rows.length,
     },
     canDownload,
-    audit: { checksum: "", rowCount: 0, schemaVersion: 1, isValid: false }, // temporary
   };
-
-  preview.audit = auditCsvRows(previewToCsvRecords(preview));
-  return preview;
 }
 
 /**

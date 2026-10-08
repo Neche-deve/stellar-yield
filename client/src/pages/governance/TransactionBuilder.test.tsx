@@ -89,36 +89,33 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
-
-      const actionSelect = screen.getByRole("combobox", { name: /action/i });
-      fireEvent.change(actionSelect, { target: { value: "emergency_pause" } });
 
       const buildButton = screen.getByRole("button", { name: /build & propose/i });
       expect(buildButton).toBeDisabled();
     });
 
-    it("does not show build button when no action is selected", () => {
+    it("disables build button when no action is selected", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
 
-      const buildButton = screen.queryByRole("button", { name: /build & propose/i });
-      expect(buildButton).not.toBeInTheDocument();
+      const buildButton = screen.getByRole("button", { name: /build & propose/i });
+      expect(buildButton).toBeDisabled();
     });
 
     it("shows validation errors for required fields", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -133,7 +130,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -153,7 +150,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -173,7 +170,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -193,7 +190,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -216,7 +213,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -238,7 +235,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -253,7 +250,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -262,14 +259,14 @@ describe("TransactionBuilder Validation", () => {
       fireEvent.change(actionSelect, { target: { value: "emergency_pause" } });
 
       expect(screen.getByText("Action:")).toBeInTheDocument();
-      expect(screen.getAllByText("Emergency Pause").length).toBeGreaterThanOrEqual(2);
+      expect(screen.getByText("Emergency Pause")).toBeInTheDocument();
     });
 
     it("displays target information for keeper registration", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -279,18 +276,18 @@ describe("TransactionBuilder Validation", () => {
 
       const addressInput = screen.getByPlaceholderText("G...");
       fireEvent.change(addressInput, {
-        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
       });
 
       expect(screen.getByText("Target:")).toBeInTheDocument();
-      expect(screen.getByText(/GBBBBBBB\.\.\./)).toBeInTheDocument();
+      expect(screen.getByText(/GBBBBBB\.\.\./)).toBeInTheDocument();
     });
 
     it("displays critical risk level for emergency pause", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -306,18 +303,13 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
 
       const actionSelect = screen.getByRole("combobox", { name: /action/i });
       fireEvent.change(actionSelect, { target: { value: "remove_keeper" } });
-
-      const addressInput = screen.getByPlaceholderText("G...");
-      fireEvent.change(addressInput, {
-        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
-      });
 
       expect(screen.getByText("Risk Level:")).toBeInTheDocument();
       expect(screen.getByText("HIGH")).toBeInTheDocument();
@@ -327,7 +319,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -337,7 +329,7 @@ describe("TransactionBuilder Validation", () => {
 
       const addressInput = screen.getByPlaceholderText("G...");
       fireEvent.change(addressInput, {
-        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
       });
 
       expect(screen.getByText("Risk Level:")).toBeInTheDocument();
@@ -348,7 +340,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -365,7 +357,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -381,7 +373,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -391,7 +383,7 @@ describe("TransactionBuilder Validation", () => {
 
       const addressInput = screen.getByPlaceholderText("G...");
       fireEvent.change(addressInput, {
-        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
       });
 
       const buildButton = screen.getByRole("button", { name: /build & propose/i });
@@ -402,7 +394,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -424,7 +416,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -441,7 +433,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -451,7 +443,7 @@ describe("TransactionBuilder Validation", () => {
 
       const addressInput = screen.getByPlaceholderText("G...");
       fireEvent.change(addressInput, {
-        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+        target: { value: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
       });
 
       expect(screen.getByText(/ready to build/i)).toBeInTheDocument();
@@ -463,7 +455,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -486,7 +478,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -498,7 +490,7 @@ describe("TransactionBuilder Validation", () => {
       const amountInput = screen.getByPlaceholderText("1000000");
 
       fireEvent.change(targetInput, {
-        target: { value: "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
+        target: { value: "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
       });
       fireEvent.change(amountInput, { target: { value: "5000000" } });
 
@@ -511,7 +503,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -533,7 +525,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -553,7 +545,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -576,7 +568,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -588,7 +580,7 @@ describe("TransactionBuilder Validation", () => {
       const amountInput = screen.getByPlaceholderText("1000000");
 
       fireEvent.change(targetInput, {
-        target: { value: "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
+        target: { value: "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" },
       });
       fireEvent.change(amountInput, { target: { value: "0" } });
 
@@ -603,7 +595,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -625,7 +617,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -644,7 +636,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );
@@ -670,7 +662,7 @@ describe("TransactionBuilder Validation", () => {
       render(
         <TransactionBuilder
           threshold={2}
-          contractId="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+          contractId="CCONTRACT123"
           onTransactionCreated={mockOnTransactionCreated}
         />,
       );

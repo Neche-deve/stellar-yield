@@ -15,7 +15,6 @@ import type {
 import {
   checkThresholdTrigger,
   generateAlertMessage,
-  computeApyDropPct,
 } from "../../../shared/types/watchlist";
 
 const prisma = new PrismaClient();
@@ -43,10 +42,6 @@ export class WatchlistService {
       opportunityName: item.opportunityName,
       currentApy: item.currentApy,
       currentTvl: item.currentTvl,
-      apyDropPct:
-        item.baselineApy !== undefined
-          ? computeApyDropPct(item.baselineApy, item.currentApy) ?? undefined
-          : undefined,
       ruleCount: item.rules.length,
       alertCount: item.triggeredAlerts.length,
       lastAlertTime:
@@ -71,8 +66,7 @@ export class WatchlistService {
     opportunityType: string,
     opportunityName: string,
     currentApy: number,
-    currentTvl: number,
-    baselineApy?: number
+    currentTvl: number
   ): Promise<YieldOpportunityWatchItem> {
     const item = await prisma.yieldOpportunityWatchItem.create({
       data: {
@@ -83,7 +77,6 @@ export class WatchlistService {
         opportunityName,
         currentApy,
         currentTvl,
-        baselineApy,
         rules: [],
         triggeredAlerts: [],
       },
@@ -186,19 +179,13 @@ export class WatchlistService {
     }
 
     const results: ThresholdCheckResult[] = [];
-    const hasDropRule = item.rules.some((r) => r.type === "apy_drop_pct");
-    const nextBaselineApy =
-      hasDropRule && item.baselineApy !== undefined
-        ? Math.max(item.baselineApy, currentApy)
-        : item.baselineApy;
 
     for (const rule of item.rules) {
       const triggered = checkThresholdTrigger(
         rule,
         currentApy,
         currentTvl,
-        spreadChange,
-        item.baselineApy
+        spreadChange
       );
 
       const previousAlert = item.triggeredAlerts.find((a) => a.ruleId === rule.id);
@@ -210,8 +197,7 @@ export class WatchlistService {
           rule,
           currentApy,
           currentTvl,
-          spreadChange,
-          item.baselineApy
+          spreadChange
         );
 
         // Add or update alert
@@ -238,7 +224,6 @@ export class WatchlistService {
           data: {
             currentApy,
             currentTvl,
-            baselineApy: nextBaselineApy,
             lastMetricUpdate: new Date(),
             triggeredAlerts: updatedAlerts,
             updatedAt: new Date(),
@@ -263,7 +248,6 @@ export class WatchlistService {
           data: {
             currentApy,
             currentTvl,
-            baselineApy: nextBaselineApy,
             lastMetricUpdate: new Date(),
             triggeredAlerts: updatedAlerts,
             updatedAt: new Date(),
@@ -283,7 +267,6 @@ export class WatchlistService {
           data: {
             currentApy,
             currentTvl,
-            baselineApy: nextBaselineApy,
             lastMetricUpdate: new Date(),
             updatedAt: new Date(),
           },

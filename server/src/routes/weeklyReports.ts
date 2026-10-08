@@ -11,7 +11,6 @@ import {
   calculateWeeklyYieldReport,
 } from "../services/weeklyYieldReportService";
 import { renderWeeklyYieldReport } from "../templates/weeklyYieldReportTemplate";
-import { createScheduledReportFilename } from "../services/export/csvGenerator";
 import {
   runWeeklyYieldReportJobNow,
   getJobStatus,
@@ -166,19 +165,12 @@ weeklyReportsRouter.get(
       }
 
       const csv = exportReportsToCSV(reports);
-      const { startDate, endDate } = getWeeklyDateRange();
-      const filename = createScheduledReportFilename({
-        reportType: "weekly-yield-reports",
-        frequency: "weekly",
-        periodStart: startDate,
-        periodEnd: endDate,
-        extension: "csv",
-      });
+      const { startDate } = getWeeklyDateRange();
 
       res.setHeader("Content-Type", "text/csv");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${filename}"`,
+        `attachment; filename="weekly-yield-reports-${startDate.toISOString().split("T")[0]}.csv"`,
       );
       res.send(csv);
     } catch (error) {

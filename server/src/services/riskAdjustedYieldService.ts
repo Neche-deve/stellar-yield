@@ -76,9 +76,7 @@ export function rankStrategies(
   withScores.sort((a, b) => {
     const diff = b.riskAdjustedYield - a.riskAdjustedYield;
     if (Math.abs(diff) > 1e-9) return diff;
-    const tvlDiff = b.tvlUsd - a.tvlUsd;
-    if (tvlDiff !== 0) return tvlDiff;
-    return a.id.localeCompare(b.id);
+    return b.tvlUsd - a.tvlUsd;
   });
 
   return withScores.map((s, i) => ({ ...s, rank: i + 1 }));

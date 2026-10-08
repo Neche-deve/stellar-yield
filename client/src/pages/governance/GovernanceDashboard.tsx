@@ -5,7 +5,6 @@ import { useGovernanceStore } from "./useGovernanceStore";
 import TransactionBuilder from "./TransactionBuilder";
 import PendingTransactionCard from "./PendingTransactionCard";
 import GovernanceForecast from "./GovernanceForecast";
-import ProposalAttachments from "./ProposalAttachments";
 import type { GovernanceConfig, PendingTransaction } from "./types";
 
 export default function GovernanceDashboard() {
@@ -164,9 +163,6 @@ export default function GovernanceDashboard() {
         />
       )}
 
-      {/* Proposal Attachments */}
-      {isSigner && <ProposalAttachments />}
-
       {!isSigner && walletAddress && (
         <div className="glass-card p-5 text-center text-gray-400">
           <FileSignature size={24} className="mx-auto mb-2 text-gray-500" />
@@ -189,7 +185,6 @@ export default function GovernanceDashboard() {
               transaction={tx}
               onSign={addSignature}
               onExecute={markExecuted}
-              config={config}
             />
           ))}
         </div>
@@ -205,7 +200,6 @@ export default function GovernanceDashboard() {
               transaction={tx}
               onSign={addSignature}
               onExecute={markExecuted}
-              config={config}
             />
           ))}
         </div>
@@ -223,7 +217,6 @@ export default function GovernanceDashboard() {
               transaction={tx}
               onSign={addSignature}
               onExecute={markExecuted}
-              config={config}
             />
           ))}
         </div>

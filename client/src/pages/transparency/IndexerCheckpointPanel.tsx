@@ -14,7 +14,6 @@ import { apiUrl } from "../../lib/api";
 import {
   getIndexerStatusDisplay,
   formatLag,
-  formatDuplicatesSuppressed,
   isIndexerDegraded,
   type IndexerStatus,
 } from "./indexerStatus";
@@ -47,9 +46,6 @@ export default function IndexerCheckpointPanel() {
   }, [fetchStatus]);
 
   const display = status ? getIndexerStatusDisplay(status.status) : null;
-  const duplicatesSuppressed = status
-    ? formatDuplicatesSuppressed(status.duplicatesSkipped)
-    : null;
 
   return (
     <div className="glass-panel p-6 space-y-4">
@@ -108,12 +104,6 @@ export default function IndexerCheckpointPanel() {
               label="Lag (ledgers)"
               value={status.lagLedgers !== null ? String(status.lagLedgers) : "—"}
             />
-            {duplicatesSuppressed !== null && (
-              <Metric
-                label="Duplicates suppressed"
-                value={String(status.duplicatesSkipped ?? 0)}
-              />
-            )}
           </div>
 
           <div>

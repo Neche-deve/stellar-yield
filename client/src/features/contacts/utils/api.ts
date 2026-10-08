@@ -229,49 +229,24 @@ export async function searchContacts(
 }
 
 /**
- * Import contacts from encrypted backup with duplicate detection
+ * Import contacts from encrypted backup
  * 
  * @param encryptedBackup Base64 encoded encrypted backup data
  * @param decryptKey Decryption key for backup data
- * @returns Promise<ImportResult> Import result with contacts and summary
+ * @returns Promise<Contact[]> Imported contacts
  */
-export interface ImportResult {
-  contacts: Contact[];
-  total: number;
-  skipped: number;
-  summary: {
-    total: number;
-    new: number;
-    duplicate: number;
-    updated: number;
-  };
-}
-
 export async function importContacts(
   encryptedBackup: string,
   decryptKey: CryptoKey
-): Promise<ImportResult> {
-  const response = await apiRequest<{
-    contacts: EncryptedContactResponse[];
-    total: number;
-    skipped: number;
-    summary: {
-      total: number;
-      new: number;
-      duplicate: number;
-      updated: number;
-    };
-  }>('/import', {
+): Promise<Contact[]> {
+  const response = await apiRequest<{ contacts: EncryptedContactResponse[] }>('/import', {
     method: 'POST',
     body: JSON.stringify({ encryptedBackup }),
   });
 
-  return {
-    contacts: response.contacts.map(contact => transformContactResponse(contact)),
-    total: response.total,
-    skipped: response.skipped,
-    summary: response.summary,
-  };
+  return response.contacts.map(contact => 
+    transformContactResponse(contact)
+  );
 }
 
 /**

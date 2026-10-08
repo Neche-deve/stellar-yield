@@ -69,7 +69,6 @@ export {
   importContacts,
   exportContacts,
   ContactsApiError,
-  type ImportResult,
 } from './utils/api';
 
 // Types
