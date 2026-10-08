@@ -1,0 +1,329 @@
+import {
+  getRecommendationTimeline,
+  type RecommendationTimelineEntry,
+} from "./recommendationTimelineService";
+import {
+  decodeTimelineCursor,
+  encodeTimelineCursor,
+  isBeforeTimelineCursor,
+  PAGINATION_DEFAULT_LIMIT,
+  PAGINATION_MAX_LIMIT,
+  type PaginatedResponse,
+} from "../types/pagination";
+
+export type AccountActivityEventType =
+  | "deposit"
+  | "withdrawal"
+  | "reward"
+  | "recommendation"
+  | "alert"
+  | "rebalance";
+
+export type TransactionStatus = "completed" | "pending" | "failed";
+
+export interface AccountActivityFilters {
+  types?: AccountActivityEventType[];
+  protocol?: string;
+  asset?: string;
+  status?: TransactionStatus;
+}
+
+export interface AccountActivityEvent {
+  id: string;
+  walletAddress: string;
+  type: AccountActivityEventType;
+  title: string;
+  description: string;
+  timestamp: string;
+  source: "portfolio" | "rewards" | "advisor" | "monitoring" | "automation";
+  amountUsd?: number;
+  assetSymbol?: string;
+  protocol?: string;
+  status?: TransactionStatus;
+  severity?: "info" | "warning" | "critical";
+  relatedVaultId?: string;
+  metadata?: Record<string, string | number | boolean | null>;
+}
+
+interface TransactionSeed {
+  id: string;
+  type: "deposit" | "withdrawal";
+  amountUsd: number;
+  assetSymbol: string;
+  protocol: string;
+  timestamp: string;
+}
+
+interface RewardSeed {
+  id: string;
+  amountUsd: number;
+  assetSymbol: string;
+  protocol: string;
+  timestamp: string;
+}
+
+interface AlertSeed {
+  id: string;
+  vaultId: string;
+  condition: string;
+  severity: "warning" | "critical";
+  timestamp: string;
+}
+
+interface RebalanceSeed {
+  id: string;
+  vaultId: string;
+  fromProtocol: string;
+  toProtocol: string;
+  expectedApyDeltaPct: number;
+  timestamp: string;
+}
+
+const TRANSACTION_SEEDS: TransactionSeed[] = [
+  {
+    id: "tx-1",
+    type: "deposit",
+    amountUsd: 5_000,
+    assetSymbol: "USDC",
+    protocol: "Blend Stable",
+    timestamp: "2026-05-26T08:15:00.000Z",
+  },
+  {
+    id: "tx-2",
+    type: "withdrawal",
+    amountUsd: 620,
+    assetSymbol: "USDC",
+    protocol: "Blend Stable",
+    timestamp: "2026-05-25T14:22:00.000Z",
+  },
+  {
+    id: "tx-3",
+    type: "deposit",
+    amountUsd: 1_850,
+    assetSymbol: "XLM",
+    protocol: "Soroswap Yield LP",
+    timestamp: "2026-05-24T10:05:00.000Z",
+  },
+];
+
+const REWARD_SEEDS: RewardSeed[] = [
+  {
+    id: "reward-1",
+    amountUsd: 84.5,
+    assetSymbol: "YIELD",
+    protocol: "Yield Index",
+    timestamp: "2026-05-26T06:30:00.000Z",
+  },
+  {
+    id: "reward-2",
+    amountUsd: 19.25,
+    assetSymbol: "BLND",
+    protocol: "Blend Stable",
+    timestamp: "2026-05-24T18:45:00.000Z",
+  },
+];
+
+const ALERT_SEEDS: AlertSeed[] = [
+  {
+    id: "alert-1",
+    vaultId: "Blend Stable",
+    condition: "Risk score moved above your watch threshold",
+    severity: "warning",
+    timestamp: "2026-05-26T09:40:00.000Z",
+  },
+  {
+    id: "alert-2",
+    vaultId: "Yield Index",
+    condition: "Freshness lag exceeded 12 hours",
+    severity: "critical",
+    timestamp: "2026-05-23T11:00:00.000Z",
+  },
+];
+
+const REBALANCE_SEEDS: RebalanceSeed[] = [
+  {
+    id: "rebalance-1",
+    vaultId: "Yield Index",
+    fromProtocol: "Blend Stable",
+    toProtocol: "Soroswap Yield LP",
+    expectedApyDeltaPct: 1.4,
+    timestamp: "2026-05-25T07:10:00.000Z",
+  },
+];
+
+function mapRecommendationEvent(
+  walletAddress: string,
+  entry: RecommendationTimelineEntry,
+): AccountActivityEvent {
+  return {
+    id: `recommendation-${entry.id}`,
+    walletAddress,
+    type: "recommendation",
+    title: `Advisor moved allocation toward ${entry.targetVault}`,
+    description: entry.rationale,
+    timestamp: entry.timestamp,
+    source: "advisor",
+    protocol: entry.targetVault,
+    status: "completed",
+    severity: entry.reasonCodes.some((code) => code.severity === "critical")
+      ? "critical"
+      : entry.reasonCodes.some((code) => code.severity === "warning")
+        ? "warning"
+        : "info",
+    relatedVaultId: entry.targetVault,
+    metadata: {
+      changedInputs: entry.changedInputs.join(", "),
+    },
+  };
+}
+
+function buildSeededEvents(walletAddress: string): AccountActivityEvent[] {
+  const transactions = TRANSACTION_SEEDS.map<AccountActivityEvent>((seed) => ({
+    id: seed.id,
+    walletAddress,
+    type: seed.type,
+    title:
+      seed.type === "deposit"
+        ? `Deposited ${seed.assetSymbol} into ${seed.protocol}`
+        : `Withdrew ${seed.assetSymbol} from ${seed.protocol}`,
+    description:
+      seed.type === "deposit"
+        ? `Capital routed into ${seed.protocol} for yield capture.`
+        : `Capital withdrawn after rebalancing or user exit.`,
+    timestamp: seed.timestamp,
+    source: "portfolio",
+    amountUsd: seed.amountUsd,
+    assetSymbol: seed.assetSymbol,
+    protocol: seed.protocol,
+    status: "completed" as TransactionStatus,
+    severity: "info",
+    relatedVaultId: seed.protocol,
+  }));
+
+  const rewards = REWARD_SEEDS.map<AccountActivityEvent>((seed) => ({
+    id: seed.id,
+    walletAddress,
+    type: "reward",
+    title: `Reward accrued from ${seed.protocol}`,
+    description: `Claimable ${seed.assetSymbol} rewards were refreshed for this position.`,
+    timestamp: seed.timestamp,
+    source: "rewards",
+    amountUsd: seed.amountUsd,
+    assetSymbol: seed.assetSymbol,
+    protocol: seed.protocol,
+    status: "completed" as TransactionStatus,
+    severity: "info",
+    relatedVaultId: seed.protocol,
+  }));
+
+  const alerts = ALERT_SEEDS.map<AccountActivityEvent>((seed) => ({
+    id: seed.id,
+    walletAddress,
+    type: "alert",
+    title: `Watch alert for ${seed.vaultId}`,
+    description: seed.condition,
+    timestamp: seed.timestamp,
+    source: "monitoring",
+    severity: seed.severity,
+    relatedVaultId: seed.vaultId,
+  }));
+
+  const rebalances = REBALANCE_SEEDS.map<AccountActivityEvent>((seed) => ({
+    id: seed.id,
+    walletAddress,
+    type: "rebalance",
+    title: `Rebalanced ${seed.vaultId}`,
+    description: `Moved exposure from ${seed.fromProtocol} to ${seed.toProtocol} for an estimated ${seed.expectedApyDeltaPct.toFixed(1)}% APY lift.`,
+    timestamp: seed.timestamp,
+    source: "automation",
+    severity: "info",
+    relatedVaultId: seed.vaultId,
+    metadata: {
+      expectedApyDeltaPct: seed.expectedApyDeltaPct,
+      fromProtocol: seed.fromProtocol,
+      toProtocol: seed.toProtocol,
+    },
+  }));
+
+  return [...transactions, ...rewards, ...alerts, ...rebalances];
+}
+
+export function buildUnifiedAccountTimeline(
+  walletAddress: string,
+  filters?: AccountActivityFilters,
+): AccountActivityEvent[] {
+  const seededEvents = buildSeededEvents(walletAddress);
+  const recommendationEvents = getRecommendationTimeline(walletAddress).map((entry) =>
+    mapRecommendationEvent(walletAddress, entry),
+  );
+
+  const allEvents = [...seededEvents, ...recommendationEvents].sort(
+    (left, right) =>
+      new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime(),
+  );
+
+  if (!filters) {
+    return allEvents;
+  }
+
+  return allEvents.filter((event) => {
+    if (filters.types && filters.types.length > 0) {
+      if (!filters.types.includes(event.type)) return false;
+    }
+    if (filters.protocol && event.protocol !== filters.protocol) return false;
+    if (filters.asset && event.assetSymbol !== filters.asset) return false;
+    if (filters.status && event.status !== filters.status) return false;
+    return true;
+  });
+}
+
+export interface AccountActivityPaginationOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+/**
+ * Cursor-paginated account activity timeline (#1305).
+ *
+ * Follows the shared `PaginatedResponse` contract (`cursor`/`limit` query
+ * params, `{data, pagination: {nextCursor, hasMore, limit}}` response).
+ * Sort is newest-first with an `(timestamp, id)` compound cursor so pages
+ * are stable under timestamp collisions and mid-pagination inserts.
+ * A missing or malformed cursor starts from the first page.
+ */
+export function getAccountActivityPaginated(
+  walletAddress: string,
+  filters?: AccountActivityFilters,
+  options: AccountActivityPaginationOptions = {},
+): PaginatedResponse<AccountActivityEvent> {
+  const rawLimit = options.limit ?? PAGINATION_DEFAULT_LIMIT;
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(Math.max(1, Math.floor(rawLimit)), PAGINATION_MAX_LIMIT)
+    : PAGINATION_DEFAULT_LIMIT;
+
+  const all = buildUnifiedAccountTimeline(walletAddress, filters);
+  const cursor = decodeTimelineCursor(options.cursor ?? null);
+
+  const eligible = cursor
+    ? all.filter((event) =>
+        isBeforeTimelineCursor(
+          { ts: new Date(event.timestamp).getTime(), id: event.id },
+          cursor,
+        ),
+      )
+    : all;
+
+  const hasMore = eligible.length > limit;
+  const data = hasMore ? eligible.slice(0, limit) : eligible;
+  const last = data[data.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? encodeTimelineCursor({
+          ts: new Date(last.timestamp).getTime(),
+          id: last.id,
+        })
+      : null;
+
+  return { data, pagination: { nextCursor, hasMore, limit } };
+}
+

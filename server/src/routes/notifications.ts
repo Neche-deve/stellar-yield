@@ -1,0 +1,197 @@
+import { Router, Request, Response } from "express";
+import { PrismaClient } from "@prisma/client";
+import { sendError } from "../utils/errorResponse";
+import { validateWalletAddress } from "../middleware/validation";
+import {
+  getWatchlistDigestPreference,
+  saveWatchlistDigestPreference,
+  type WatchlistDigestPreference,
+} from "../services/digest";
+import { recordUserPreferenceChange } from "../services/userPreferenceAuditService";
+
+const router = Router();
+const prisma = new PrismaClient();
+
+router.get("/", (_req: Request, res: Response) => {
+  res.json([]);
+});
+
+router.get(
+  "/digest/preferences/:walletAddress",
+  validateWalletAddress,
+  (req: Request, res: Response) => {
+    const { walletAddress } = req.params;
+    res.json(getWatchlistDigestPreference(walletAddress));
+  },
+);
+
+router.put(
+  "/digest/preferences/:walletAddress",
+  validateWalletAddress,
+  (req: Request, res: Response) => {
+    const { walletAddress } = req.params;
+    const body = req.body as Partial<WatchlistDigestPreference>;
+    const scheduleMode =
+      body.scheduleMode as WatchlistDigestPreference["scheduleMode"];
+
+    if (typeof body.enabled !== "boolean") {
+      sendError(
+        res,
+        400,
+        "INVALID_DIGEST_PREFERENCES",
+        "enabled must be a boolean.",
+      );
+      return;
+    }
+
+    if (
+      !["daily", "weekly", "event_threshold"].includes(
+        String(body.scheduleMode),
+      )
+    ) {
+      sendError(
+        res,
+        400,
+        "INVALID_DIGEST_PREFERENCES",
+        "scheduleMode must be daily, weekly, or event_threshold.",
+      );
+      return;
+    }
+
+    const watchedVaultIds = Array.isArray(body.watchedVaultIds)
+      ? body.watchedVaultIds.filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
+
+    const before = getWatchlistDigestPreference(walletAddress);
+    const after = saveWatchlistDigestPreference(walletAddress, {
+      enabled: body.enabled,
+      scheduleMode,
+      eventThreshold: Number(body.eventThreshold ?? 2),
+      watchedVaultIds,
+      minApyDeltaPct: Number(body.minApyDeltaPct ?? 0.5),
+      minRiskDelta: Number(body.minRiskDelta ?? 5),
+      maxFreshnessHours: Number(body.maxFreshnessHours ?? 12),
+    });
+
+    const actor =
+      ((req as unknown as { user?: { id?: string } }).user?.id as string) ||
+      walletAddress;
+    recordUserPreferenceChange({
+      walletAddress,
+      category: "digest_preference",
+      actor,
+      source: "api",
+      before,
+      after,
+      reason:
+        typeof body.reason === "string" ? body.reason : undefined,
+    });
+
+    res.json(after);
+  },
+);
+
+// FETCH notifications for a user
+router.get(
+  "/:walletAddress",
+  validateWalletAddress,
+  async (req: Request, res: Response) => {
+    const { walletAddress } = req.params;
+    try {
+      const notifications = await prisma.notification.findMany({
+        where: { walletAddress },
+        orderBy: { createdAt: "desc" },
+      });
+      res.json(notifications);
+    } catch {
+      sendError(
+        res,
+        500,
+        "FETCH_NOTIFICATIONS_FAILED",
+        "Failed to fetch notifications.",
+      );
+    }
+  },
+);
+
+// MARK single notification as read
+router.patch("/:id/read", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  try {
+    const notification = await prisma.notification.update({
+      where: { id },
+      data: { isRead: true },
+    });
+    res.json(notification);
+  } catch {
+    sendError(res, 500, "MARK_READ_FAILED", "Failed to mark as read.");
+  }
+});
+
+// MARK all notifications as read for a user
+router.patch(
+  "/:walletAddress/read-all",
+  validateWalletAddress,
+  async (req: Request, res: Response) => {
+    const { walletAddress } = req.params;
+    try {
+      const result = await prisma.notification.updateMany({
+        where: { walletAddress, isRead: false },
+        data: { isRead: true },
+      });
+      res.json({ marked: result.count });
+    } catch {
+      sendError(
+        res,
+        500,
+        "MARK_ALL_READ_FAILED",
+        "Failed to mark all as read.",
+      );
+    }
+  },
+);
+
+// GET unread count for a user
+router.get(
+  "/:walletAddress/unread-count",
+  validateWalletAddress,
+  async (req: Request, res: Response) => {
+    const { walletAddress } = req.params;
+    try {
+      const unreadCount = await prisma.notification.count({
+        where: { walletAddress, isRead: false },
+      });
+      res.json({ unreadCount });
+    } catch {
+      sendError(
+        res,
+        500,
+        "UNREAD_COUNT_FAILED",
+        "Failed to fetch unread count.",
+      );
+    }
+  },
+);
+
+// CLEAR all notifications
+router.delete("/:walletAddress", async (req: Request, res: Response) => {
+  const { walletAddress } = req.params;
+  try {
+    await prisma.notification.deleteMany({
+      where: { walletAddress },
+    });
+    res.sendStatus(204);
+  } catch {
+    sendError(
+      res,
+      500,
+      "CLEAR_NOTIFICATIONS_FAILED",
+      "Failed to clear notifications.",
+    );
+  }
+});
+
+export default router;

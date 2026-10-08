@@ -1,0 +1,181 @@
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { isConnected } from "@stellar/freighter-api";
+import {
+  clearStoredSession,
+  connectWalletSession,
+  isSessionExpired,
+  loadStoredSession,
+  recoverSession,
+} from "../auth/session";
+import { getAdapter } from "../auth/walletAdapters";
+import type { ConnectWalletOptions, ExtensionWalletProviderId, WalletSession } from "../auth/types";
+import { WalletContext } from "./WalletContextObject";
+
+import {
+  clearSensitiveWalletState,
+  clearPendingTransactionDrafts,
+} from "../services/transactionDraft";
+
+export function WalletProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<WalletSession | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isFreighterInstalled, setIsFreighterInstalled] = useState<
+    boolean | null
+  >(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    // On mount, attempt to recover any persisted session rather than loading
+    // the raw stored value directly. recoverSession() checks TTL, probes
+    // provider availability, and re-verifies smart wallet credentials so the
+    // context starts in an accurate state after a page reload.
+    let cancelled = false;
+
+    recoverSession().then((result) => {
+      if (cancelled) return;
+      if (result.session) {
+        setSession(result.session);
+      }
+    }).catch(() => {
+      // Fallback: load without recovery so the user is not silently logged out
+      if (!cancelled) setSession(loadStoredSession());
+    });
+
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    async function checkConnection() {
+      try {
+        const connectionResult = await isConnected();
+
+        if (connectionResult.error || !connectionResult.isConnected) {
+          setIsFreighterInstalled(false);
+          return;
+        }
+
+        setIsFreighterInstalled(true);
+      } catch (error) {
+        console.error("Unable to inspect Freighter connection", error);
+        setIsFreighterInstalled(false);
+      }
+    }
+
+    void checkConnection();
+  }, []);
+
+  async function connectWallet(options?: ConnectWalletOptions) {
+    setIsConnecting(true);
+    setErrorMessage(null);
+
+    try {
+      const nextSession = await connectWalletSession(options);
+      // Account switch detection: if connecting a different account, clear prior pending draft payloads
+      if (session?.walletAddress && session.walletAddress !== nextSession.walletAddress) {
+        clearPendingTransactionDrafts();
+      }
+      setSession(nextSession);
+      return true;
+    } catch (error) {
+      console.error("Wallet connection failed", error);
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Wallet connection failed. Please try again.",
+      );
+      return false;
+    } finally {
+      setIsConnecting(false);
+    }
+  }
+
+  function disconnectWallet() {
+    clearStoredSession();
+    clearSensitiveWalletState();
+    setSession(null);
+    setErrorMessage(null);
+
+    // Clear wallet-specific cached data and session state
+    try {
+      // Clear any in-flight pending transaction state or notifications
+      // by resetting browser's fetch/cache for wallet-dependent endpoints
+      if ('caches' in window) {
+        void (async () => {
+          try {
+            const cacheNames = await caches.keys();
+            for (const cacheName of cacheNames) {
+              const cache = await caches.open(cacheName);
+              const requests = await cache.keys();
+              for (const request of requests) {
+                if (request.url.includes('/api/users/') ||
+                    request.url.includes('/api/rewards/') ||
+                    request.url.includes('/api/referrals/') ||
+                    request.url.includes('/api/yields/')) {
+                  await cache.delete(request);
+                }
+              }
+            }
+          } catch {
+            // Cache API might not be available in all environments
+          }
+        })();
+      }
+    } catch {
+      // localStorage or other APIs might not be available
+    }
+  }
+
+  function clearError() {
+    setErrorMessage(null);
+  }
+
+  async function signTransaction(xdr: string, networkPassphrase: string): Promise<string> {
+    if (!session) {
+      throw new Error("No wallet connected.");
+    }
+    const EXTENSION_PROVIDERS: ExtensionWalletProviderId[] = ["freighter", "xbull", "albedo"];
+    if ((EXTENSION_PROVIDERS as string[]).includes(session.providerId)) {
+      const adapter = getAdapter(session.providerId as ExtensionWalletProviderId);
+      if (!adapter) {
+        throw new Error(`No adapter for provider: ${session.providerId}`);
+      }
+      return adapter.signTransaction(xdr, networkPassphrase);
+    }
+    // Smart wallet (email / google / github) sessions don't support direct signing
+    throw new Error("signTransaction is not supported for smart wallet sessions.");
+  }
+
+  const value = useMemo(
+    () => ({
+      walletAddress: session?.walletAddress ?? null,
+      walletAddressType: session?.walletAddressType ?? null,
+      providerLabel: session?.providerLabel ?? null,
+      providerId: session?.providerId ?? null,
+      network: session?.providerId ? "mainnet" : null,
+      sessionKeyAddress: session?.sessionKeyAddress ?? null,
+      verificationStatus: session?.verificationStatus ?? null,
+      connectedAt: session?.connectedAt ?? null,
+      lastActivityAt: session?.lastActivityAt ?? null,
+      isConnected: Boolean(session?.walletAddress),
+      // Issue #1152: exposed so protected flows (quote preview, tx submission)
+      // can check expiry synchronously before acting, rather than only
+      // discovering it when a signing/read call fails deep in a service.
+      isSessionExpired: session ? isSessionExpired(session) : false,
+      isConnecting,
+      isFreighterInstalled,
+      errorMessage,
+      connectWallet,
+      disconnectWallet,
+      clearError,
+      signTransaction,
+    }),
+    // signTransaction is stable: it only captures `session` which is already
+    // in the deps array below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [session, isConnecting, isFreighterInstalled, errorMessage],
+  );
+
+  return (
+    <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
+  );
+}

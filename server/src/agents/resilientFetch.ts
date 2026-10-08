@@ -1,0 +1,223 @@
+import { recordFailure as recordFailureMetric, resolveNetworkLabel } from "../monitoring/prometheus";
+
+export interface ResilientFetchOptions {
+  timeoutMs: number;
+  maxRetries: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+}
+
+const DEFAULTS: ResilientFetchOptions = {
+  timeoutMs: 15_000,
+  maxRetries: 2,
+  initialDelayMs: 500,
+  maxDelayMs: 4_000,
+};
+
+export interface CircuitBreakerState {
+  failures: number;
+  lastFailureTime: number;
+  isOpen: boolean;
+}
+
+const CIRCUIT_BREAKER_THRESHOLD = 5;
+const CIRCUIT_BREAKER_RESET_MS = 60_000;
+
+const circuitBreakers = new Map<string, CircuitBreakerState>();
+
+export function getCircuitBreaker(key: string): CircuitBreakerState {
+  if (!circuitBreakers.has(key)) {
+    circuitBreakers.set(key, { failures: 0, lastFailureTime: 0, isOpen: false });
+  }
+  return circuitBreakers.get(key)!;
+}
+
+export function resetCircuitBreaker(key: string): void {
+  circuitBreakers.set(key, { failures: 0, lastFailureTime: 0, isOpen: false });
+}
+
+export function resetAllCircuitBreakers(): void {
+  circuitBreakers.clear();
+}
+
+export interface RetryBudgetMetadata {
+  provider: string;
+  retryCount: number;
+  maxRetries: number;
+  status: "success" | "transient_failure" | "exhausted" | "circuit_open";
+  exhausted: boolean;
+  error?: string;
+}
+
+const latestRetryMetadata = new Map<string, RetryBudgetMetadata>();
+
+export function getProviderRetryMetadata(provider: string): RetryBudgetMetadata | undefined {
+  return latestRetryMetadata.get(provider);
+}
+
+export function getAllProviderRetryMetadata(): Record<string, RetryBudgetMetadata> {
+  return Object.fromEntries(latestRetryMetadata.entries());
+}
+
+export function clearProviderRetryMetadata(): void {
+  latestRetryMetadata.clear();
+}
+
+function checkCircuitBreaker(key: string): void {
+  const cb = getCircuitBreaker(key);
+
+  if (cb.isOpen) {
+    const elapsed = Date.now() - cb.lastFailureTime;
+    if (elapsed >= CIRCUIT_BREAKER_RESET_MS) {
+      cb.isOpen = false;
+      cb.failures = 0;
+    } else {
+      const err = `Circuit breaker open for "${key}": ${cb.failures} consecutive failures. Resets in ${Math.ceil((CIRCUIT_BREAKER_RESET_MS - elapsed) / 1000)}s.`;
+      latestRetryMetadata.set(key, {
+        provider: key,
+        retryCount: 0,
+        maxRetries: DEFAULTS.maxRetries,
+        status: "circuit_open",
+        exhausted: true,
+        error: err,
+      });
+      throw new Error(err);
+    }
+  }
+}
+
+function recordSuccess(key: string): void {
+  const cb = getCircuitBreaker(key);
+  cb.failures = 0;
+  cb.isOpen = false;
+}
+
+function recordFailure(key: string): void {
+  const cb = getCircuitBreaker(key);
+  cb.failures++;
+  cb.lastFailureTime = Date.now();
+  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+    cb.isOpen = true;
+  }
+  recordFailureMetric({
+    provider: key,
+    network: resolveNetworkLabel(),
+    route: "resilient_fetch",
+    failure_category: "circuit_breaker",
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryable(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes("timeout") ||
+      msg.includes("aborted") ||
+      msg.includes("network") ||
+      msg.includes("econnreset") ||
+      msg.includes("econnrefused") ||
+      msg.includes("fetch failed") ||
+      msg.includes("server error") ||
+      // 429 Too Many Requests: provider is rate-limiting us — always retryable
+      msg.includes("429") ||
+      msg.includes("rate limit") ||
+      msg.includes("too many requests")
+    );
+  }
+  return false;
+}
+
+/** Extra initial backoff (ms) applied when a 429 is detected. */
+const RATE_LIMIT_BACKOFF_EXTRA_MS = 1_500;
+
+export async function resilientFetch(
+  url: string,
+  init: RequestInit,
+  circuitKey: string,
+  opts: Partial<ResilientFetchOptions> = {},
+): Promise<Response> {
+  const options = { ...DEFAULTS, ...opts };
+
+  checkCircuitBreaker(circuitKey);
+
+  let lastError: Error | undefined;
+  let attemptsMade = 0;
+
+  for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
+    attemptsMade = attempt;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      if (response.status === 429) {
+        throw new Error(`Rate limited (429): ${response.status}`);
+      }
+
+      if (response.status >= 500) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      recordSuccess(circuitKey);
+      latestRetryMetadata.set(circuitKey, {
+        provider: circuitKey,
+        retryCount: attempt,
+        maxRetries: options.maxRetries,
+        status: "success",
+        exhausted: false,
+      });
+      console.info(
+        `[ProviderRetryBudget] provider="${circuitKey}" retries=${attempt}/${options.maxRetries} status=success exhausted=false`,
+      );
+      return response;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (attempt < options.maxRetries && isRetryable(lastError)) {
+        const isRateLimit = lastError.message.toLowerCase().includes("429") ||
+          lastError.message.toLowerCase().includes("rate limit") ||
+          lastError.message.toLowerCase().includes("too many requests");
+        const base = isRateLimit
+          ? options.initialDelayMs + RATE_LIMIT_BACKOFF_EXTRA_MS
+          : options.initialDelayMs;
+        const delay = Math.min(
+          base * Math.pow(2, attempt),
+          options.maxDelayMs,
+        );
+        await sleep(delay);
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  const isExhausted = attemptsMade >= options.maxRetries;
+  latestRetryMetadata.set(circuitKey, {
+    provider: circuitKey,
+    retryCount: attemptsMade,
+    maxRetries: options.maxRetries,
+    status: isExhausted ? "exhausted" : "transient_failure",
+    exhausted: isExhausted,
+    error: lastError?.message,
+  });
+  console.warn(
+    `[ProviderRetryBudget] provider="${circuitKey}" retries=${attemptsMade}/${options.maxRetries} status=${isExhausted ? "exhausted" : "transient_failure"} exhausted=${isExhausted} error="${lastError?.message}"`,
+  );
+
+  recordFailure(circuitKey);
+  throw lastError ?? new Error("resilientFetch failed");
+}
+
+export { CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_RESET_MS };
+

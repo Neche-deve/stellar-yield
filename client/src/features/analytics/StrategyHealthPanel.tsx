@@ -1,0 +1,428 @@
+import { useMemo, useState, useEffect } from "react";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from "recharts";
+import { Activity, AlertTriangle, CheckCircle, XCircle, TrendingUp, TrendingDown, Minus, RefreshCw, Settings } from "lucide-react";
+import StatusBadge from '../../components/StatusBadge';
+import EmptyState from '../../components/common/EmptyState';
+import { EMPTY_STATE_STRATEGY_HEALTH } from '../../utils/emptyStateCopy';
+import { FreshnessBanner } from "../../components/dashboard/FreshnessBanner";
+import { stableSort } from "../../lib/stableSort";
+import { RISK_CHART_COLORS, CHART_PANEL_BG, CHART_PANEL_AXIS } from "../../components/charts/darkModeContrast";
+import { useCachedFetch } from "../../hooks/useCachedFetch";
+
+// ── Types ───────────────────────────────────────────────────────────────
+
+interface StrategyHealthMetrics {
+  contractSafety: number;
+  dataFreshness: number;
+  providerUptime: number;
+  liquidityConditions: number;
+  executionOutcomes: number;
+  volatilityIndex: number;
+  errorRate: number;
+  latency: number;
+}
+
+interface StrategyHealthScore {
+  strategyId: string;
+  strategyName: string;
+  overallScore: number;
+  metrics: StrategyHealthMetrics;
+  status: 'healthy' | 'degraded' | 'critical' | 'disabled';
+  signals: Array<{
+    source: string;
+    metric: string;
+    value: number;
+    weight: number;
+    threshold: {
+      critical: number;
+      warning: number;
+      good: number;
+    };
+    timestamp: string;
+    reliability: number;
+  }>;
+  lastUpdated: string;
+  trend: 'improving' | 'stable' | 'declining';
+  recommendations: string[];
+  suppressUntil?: string;
+}
+
+interface StrategyHealthPanelProps {
+  strategyIds?: string[];
+}
+
+// ── Configuration ───────────────────────────────────────────────────────
+
+const STATUS_COLORS = {
+  healthy:  RISK_CHART_COLORS.healthy,
+  degraded: RISK_CHART_COLORS.degraded,
+  critical: RISK_CHART_COLORS.critical,
+  disabled: RISK_CHART_COLORS.disabled,
+};
+
+const STATUS_ICONS = {
+  healthy: <CheckCircle size={16} className="text-[#3EAC75]" />,
+  degraded: <AlertTriangle size={16} className="text-[#F5A623]" />,
+  critical: <XCircle size={16} className="text-[#FF5E5E]" />,
+  disabled: <XCircle size={16} className="text-[#6B7280]" />,
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+function getTrendIcon(trend: 'improving' | 'stable' | 'declining') {
+  switch (trend) {
+    case 'improving': return <TrendingUp size={14} className="text-[#3EAC75]" />;
+    case 'declining': return <TrendingDown size={14} className="text-[#FF5E5E]" />;
+    default: return <Minus size={14} className="text-gray-400" />;
+  }
+}
+
+function getStatusColor(score: number): string {
+  if (score >= 80) return STATUS_COLORS.healthy;
+  if (score >= 60) return STATUS_COLORS.degraded;
+  if (score >= 40) return STATUS_COLORS.critical;
+  return STATUS_COLORS.disabled;
+}
+
+function formatLatency(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
+// ── Component ───────────────────────────────────────────────────────────
+
+export default function StrategyHealthPanel({ strategyIds = ['strategy_1', 'strategy_2', 'strategy_3', 'strategy_4'] }: StrategyHealthPanelProps) {
+  const [selectedStrategy, setSelectedStrategy] = useState<StrategyHealthScore | null>(null);
+  const strategyIdsKey = useMemo(() => JSON.stringify(strategyIds), [strategyIds]);
+  const init = useMemo(() => ({
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ strategyIds }),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [strategyIdsKey]);
+
+  const {
+    data: healthScores,
+    isLoading,
+    error,
+    isOffline,
+    isFromCache,
+    fetchedAt,
+    refresh: fetchHealthScores,
+  } = useCachedFetch<StrategyHealthScore[]>('/api/analytics/health/batch', {
+    init,
+    select: (json) => (json as { data: StrategyHealthScore[] }).data,
+  });
+
+  useEffect(() => {
+    if (healthScores && healthScores.length > 0 && !selectedStrategy) {
+      setSelectedStrategy(healthScores[0]);
+    }
+  }, [healthScores, selectedStrategy]);
+
+  const getRadarData = (metrics: StrategyHealthMetrics) => [
+    { metric: 'Contract Safety', value: metrics.contractSafety * 100, fullMark: 100 },
+    { metric: 'Data Freshness', value: metrics.dataFreshness * 100, fullMark: 100 },
+    { metric: 'Provider Uptime', value: metrics.providerUptime * 100, fullMark: 100 },
+    { metric: 'Liquidity', value: metrics.liquidityConditions * 100, fullMark: 100 },
+    { metric: 'Execution', value: metrics.executionOutcomes * 100, fullMark: 100 },
+    { metric: 'Low Volatility', value: (1 - metrics.volatilityIndex) * 100, fullMark: 100 },
+  ];
+
+  if (isLoading && !healthScores) {
+    return (
+      <div className="glass-panel p-8">
+        <div className="flex items-center justify-center py-12">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#6C5DD3]"></div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && (!healthScores || healthScores.length === 0)) {
+    return (
+      <div className="glass-panel p-8" data-testid="strategy-health-error">
+        <div className="text-center py-12">
+          <AlertTriangle className="mx-auto mb-4 text-red-400" size={48} />
+          <h3 className="text-lg font-semibold mb-2">Health data is currently unavailable</h3>
+          <p className="text-gray-400 mb-4">{error}</p>
+          <button onClick={() => fetchHealthScores()} className="btn-primary">
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!healthScores || healthScores.length === 0) {
+    return (
+      <div className="glass-panel p-8" data-testid="strategy-health-empty">
+        <EmptyState
+          icon={<Activity className="text-gray-400" size={48} />}
+          title={EMPTY_STATE_STRATEGY_HEALTH.title}
+          description={EMPTY_STATE_STRATEGY_HEALTH.description}
+          testId="strategy-health-empty-state"
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold">Strategy Health Monitor</h2>
+          <p className="text-sm text-gray-400 mt-1">
+            Real-time health monitoring for all strategies
+          </p>
+        </div>
+        <button onClick={() => fetchHealthScores()} className="btn-secondary flex items-center gap-2">
+          <RefreshCw size={14} />
+          Refresh
+        </button>
+      </div>
+
+      {(isOffline || isFromCache) && (
+        <FreshnessBanner
+          lastUpdated={fetchedAt != null ? new Date(fetchedAt).toISOString() : undefined}
+          source="cache"
+          isOffline={isOffline}
+          onRefresh={() => fetchHealthScores()}
+        />
+      )}
+
+      {/* Strategy Overview Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        {stableSort(
+          healthScores,
+          (a, b) => {
+            // Unhealthy strategies surface first, then score (#1118).
+            const severity = {
+              critical: 0,
+              degraded: 1,
+              healthy: 2,
+              disabled: 3,
+            } as const;
+            const bySeverity = severity[a.status] - severity[b.status];
+            if (bySeverity !== 0) return bySeverity;
+            return b.overallScore - a.overallScore;
+          },
+          (score) => score.strategyId,
+        ).map((score) => (
+          <div
+            key={score.strategyId}
+            className={`glass-card p-4 cursor-pointer transition-all duration-200 ${
+              selectedStrategy?.strategyId === score.strategyId ? 'ring-2 ring-[#6C5DD3]' : 'hover:bg-white/5'
+            }`}
+            onClick={() => setSelectedStrategy(score)}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <StatusBadge
+                  variant={score.status === 'healthy' ? 'success' : score.status === 'degraded' ? 'warning' : score.status === 'critical' ? 'danger' : 'neutral'}
+                  label={score.status}
+                  compact
+                />
+              </div>
+              {getTrendIcon(score.trend)}
+            </div>
+            
+            <h3 className="font-semibold mb-1">{score.strategyName}</h3>
+            
+            <div className="flex items-end justify-between">
+              <div>
+                <p className="text-2xl font-bold" style={{ color: getStatusColor(score.overallScore) }}>
+                  {score.overallScore}
+                </p>
+                <p className="text-xs text-gray-400">Health Score</p>
+              </div>
+              
+              <div className="w-12 h-12">
+                <svg viewBox="0 0 36 36" className="transform -rotate-90">
+                  <path
+                    d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                    fill="none"
+                    stroke="#ffffff20"
+                    strokeWidth="3"
+                  />
+                  <path
+                    d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                    fill="none"
+                    stroke={getStatusColor(score.overallScore)}
+                    strokeWidth="3"
+                    strokeDasharray={`${score.overallScore}, 100`}
+                  />
+                </svg>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Detailed View */}
+      {selectedStrategy && (
+        <div className="glass-panel p-6">
+          <div className="flex items-center justify-between mb-6">
+            <div>
+              <h3 className="text-lg font-semibold">{selectedStrategy.strategyName}</h3>
+              <p className="text-sm text-gray-400">
+                Last updated: {new Date(selectedStrategy.lastUpdated).toLocaleString()}
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3">
+                <StatusBadge
+                  variant={selectedStrategy.status === 'healthy' ? 'success' : selectedStrategy.status === 'degraded' ? 'warning' : selectedStrategy.status === 'critical' ? 'danger' : 'neutral'}
+                  label={selectedStrategy.status}
+                  compact
+                />
+                <span className="text-lg font-bold" style={{ color: getStatusColor(selectedStrategy.overallScore) }}>
+                  {selectedStrategy.overallScore}/100
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <FreshnessBanner 
+              lastUpdated={selectedStrategy.lastUpdated}
+              confidence={selectedStrategy.metrics.dataFreshness}
+            />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Metrics Radar Chart */}
+            <div>
+              <h4 className="font-semibold mb-4">Performance Metrics</h4>
+              <ResponsiveContainer width="100%" height={300}>
+                <RadarChart data={getRadarData(selectedStrategy.metrics)}>
+                  <PolarGrid stroke="#ffffff20" />
+                  <PolarAngleAxis dataKey="metric" tick={{ fill: CHART_PANEL_AXIS, fontSize: 12 }} />
+                  <PolarRadiusAxis
+                    angle={90}
+                    domain={[0, 100]}
+                    tick={{ fill: CHART_PANEL_AXIS, fontSize: 10 }}
+                  />
+                  <Radar
+                    name="Health Score"
+                    dataKey="value"
+                    stroke={getStatusColor(selectedStrategy.overallScore)}
+                    fill={getStatusColor(selectedStrategy.overallScore)}
+                    fillOpacity={0.3}
+                  />
+                  <Tooltip
+                    contentStyle={{ backgroundColor: CHART_PANEL_BG, border: "1px solid #374151" }}
+                  />
+                </RadarChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Detailed Metrics */}
+            <div>
+              <h4 className="font-semibold mb-4">Detailed Metrics</h4>
+              <div className="space-y-3">
+                {Object.entries(selectedStrategy.metrics).map(([metric, value]) => {
+                  const displayName = metric.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+                  const isPercentage = ['contractSafety', 'dataFreshness', 'providerUptime', 'liquidityConditions', 'executionOutcomes'].includes(metric);
+                  const isErrorRate = metric === 'errorRate';
+                  const isLatency = metric === 'latency';
+                  const isVolatility = metric === 'volatilityIndex';
+                  
+                  let displayValue: string;
+                  let color: string = STATUS_COLORS.healthy;
+
+                  if (isPercentage) {
+                    displayValue = `${(value * 100).toFixed(1)}%`;
+                    color = value >= 0.8 ? STATUS_COLORS.healthy : value >= 0.6 ? STATUS_COLORS.degraded : STATUS_COLORS.critical;
+                  } else if (isErrorRate) {
+                    displayValue = `${(value * 100).toFixed(2)}%`;
+                    color = value <= 0.01 ? STATUS_COLORS.healthy : value <= 0.05 ? STATUS_COLORS.degraded : STATUS_COLORS.critical;
+                  } else if (isLatency) {
+                    displayValue = formatLatency(value);
+                    color = value <= 200 ? STATUS_COLORS.healthy : value <= 500 ? STATUS_COLORS.degraded : STATUS_COLORS.critical;
+                  } else if (isVolatility) {
+                    displayValue = `${(value * 100).toFixed(1)}%`;
+                    color = value <= 0.3 ? STATUS_COLORS.healthy : value <= 0.5 ? STATUS_COLORS.degraded : STATUS_COLORS.critical;
+                  } else {
+                    displayValue = value.toString();
+                    color = CHART_PANEL_AXIS;
+                  }
+
+                  return (
+                    <div key={metric} className="flex items-center justify-between">
+                      <span className="text-sm text-gray-300">{displayName}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold" style={{ color }}>
+                          {displayValue}
+                        </span>
+                        <div className="w-16 bg-white/20 rounded-full h-2">
+                          <div 
+                            className="h-2 rounded-full transition-all duration-300"
+                            style={{ 
+                              width: `${isPercentage || isErrorRate || isVolatility ? value * 100 : Math.min(100, (value / 1000) * 100)}%`,
+                              backgroundColor: color 
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Recommendations */}
+          {selectedStrategy.recommendations.length > 0 && (
+            <div className="mt-6 border-t border-white/10 pt-6">
+              <h4 className="font-semibold mb-3 flex items-center gap-2">
+                <Settings size={16} />
+                Recommendations
+              </h4>
+              <div className="space-y-2">
+                {selectedStrategy.recommendations.map((recommendation, index) => (
+                  <div key={index} className="flex items-start gap-2 text-sm">
+                    <div className="w-2 h-2 rounded-full bg-[#F5A623] mt-1.5 flex-shrink-0" />
+                    <span className="text-gray-300">{recommendation}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Recent Signals */}
+      <div className="glass-panel p-6">
+        <h3 className="text-lg font-semibold mb-4">Recent Health Signals</h3>
+        <div className="space-y-3">
+          {selectedStrategy &&
+            stableSort(
+              selectedStrategy.signals,
+              (a, b) =>
+                new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+              (signal) => `${signal.source}|${signal.metric}`,
+            )
+              .slice(0, 5)
+              .map((signal, index) => (
+            <div key={index} className="flex items-center justify-between text-sm border-b border-white/5 pb-2">
+              <div className="flex items-center gap-3">
+                <span className="text-gray-400">{signal.source}</span>
+                <span className="text-gray-300">{signal.metric}</span>
+              </div>
+              <div className="flex items-center gap-4">
+                <span className="font-semibold">{signal.value}</span>
+                <span className="text-gray-400">
+                  {new Date(signal.timestamp).toLocaleTimeString()}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

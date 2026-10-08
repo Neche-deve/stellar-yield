@@ -1,0 +1,943 @@
+import { PROTOCOLS } from "../config/protocols";
+import {
+  bpsToApyPercent,
+  normalizeApyPercent,
+  roundTo,
+} from "../utils/yieldNormalizationContract";
+import type { SimulationWarning } from "../../../shared/types/simulationWarning";
+
+// Re-export so consumers can import from a single service location.
+export type { SimulationWarning } from "../../../shared/types/simulationWarning";
+
+export interface SimulationParams {
+  strategyId: string;
+  amount: number;
+  token: string;
+}
+
+export interface SimulationAllocation {
+  protocol: string;
+  amount: number;
+  percentage: number;
+}
+
+export interface SimulationFee {
+  type: string;
+  amount: number;
+}
+
+export interface SimulationResult {
+  isSimulationOnly: true;
+  allocations: SimulationAllocation[];
+  expectedShares: number;
+  fees: SimulationFee[];
+  postDepositExposure: {
+    expectedApy: number;
+  };
+  routing: {
+    path: string[];
+    expectedOutput: number;
+  };
+  warnings: SimulationWarning[];
+}
+
+/**
+ * Hard ceiling on a simulated deposit amount (issue #1053). Well above any
+ * realistic deposit, but finite enough that downstream percentage/blended-APY
+ * math (`amount * bps / sum`, chart axis scaling) can't overflow or render a
+ * misleading chart for a client-supplied extreme value.
+ */
+export const MAX_SIMULATION_DEPOSIT = 1_000_000_000;
+
+export function simulateDeposit(params: SimulationParams): SimulationResult {
+  const { amount, strategyId, token: _token } = params;
+
+  // We explicitly mark this as simulation-only
+  const result: SimulationResult = {
+    isSimulationOnly: true,
+    allocations: [],
+    expectedShares: 0,
+    fees: [],
+    postDepositExposure: { expectedApy: 0 },
+    routing: { path: [], expectedOutput: 0 },
+    warnings: [],
+  };
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    result.warnings.push({
+      code: "ZERO_AMOUNT",
+      severity: "critical",
+      affectedField: "amount",
+      message: "Amount must be a finite number greater than zero.",
+      remediation: "Enter a positive deposit amount before running the simulation.",
+    });
+    return result;
+  }
+
+  if (amount > MAX_SIMULATION_DEPOSIT) {
+    result.warnings.push({
+      code: "AMOUNT_TOO_LARGE",
+      severity: "critical",
+      affectedField: "amount",
+      message: `Amount exceeds the maximum supported simulation deposit of ${MAX_SIMULATION_DEPOSIT.toLocaleString()}.`,
+      remediation: `Reduce the deposit amount to at most ${MAX_SIMULATION_DEPOSIT.toLocaleString()} to run the simulation.`,
+    });
+    return result;
+  }
+
+  // Fees
+  // Base deposit fee (e.g. 0.1%)
+  const entryFee = amount * 0.001;
+  result.fees.push({ type: "Entry Fee", amount: entryFee });
+
+  // Gas estimate
+  const networkFee = 0.05; // 0.05 units of token/XLM
+  result.fees.push({ type: "Network Fee Estimate", amount: networkFee });
+
+  const netAmount = amount - entryFee;
+
+  // Illiquidity / Slippage warnings
+  if (amount > 100000) {
+    result.warnings.push({
+      code: "HIGH_SLIPPAGE",
+      severity: "warning",
+      affectedField: "amount",
+      message: "High slippage expected for deposits over 100k.",
+      remediation: "Consider splitting the deposit into smaller tranches to reduce price impact.",
+    });
+  }
+
+  if (amount > 1000000) {
+    result.warnings.push({
+      code: "INSUFFICIENT_LIQUIDITY",
+      severity: "critical",
+      affectedField: "amount",
+      message: "Insufficient liquidity to route this deposit fully.",
+      remediation: "Reduce the deposit size or contact the protocol to confirm available liquidity before proceeding.",
+    });
+  }
+
+  const normalizedStrategy = (strategyId || "").toLowerCase();
+  let targetProtocols = PROTOCOLS.filter((p) => p.protocolType === "blend");
+  let baseApySum = targetProtocols.reduce((acc, p) => acc + p.baseApyBps, 0);
+  let isKnownStrategy = false;
+
+  if (normalizedStrategy.includes("aggressive")) {
+    targetProtocols = PROTOCOLS.filter((p) => p.protocolType !== "blend");
+    baseApySum = targetProtocols.reduce((acc, p) => acc + p.baseApyBps, 0) || 1000;
+    isKnownStrategy = true;
+  } else if (normalizedStrategy.includes("conservative") || normalizedStrategy.includes("blend")) {
+    targetProtocols = PROTOCOLS.filter((p) => p.protocolType === "blend");
+    baseApySum = targetProtocols.reduce((acc, p) => acc + p.baseApyBps, 0);
+    isKnownStrategy = true;
+  }
+
+  if (!isKnownStrategy || targetProtocols.length === 0) {
+    result.warnings.push({
+      code: "UNSUPPORTED_STRATEGY",
+      severity: "warning",
+      affectedField: "strategyId",
+      message: "Unsupported strategy or asset combination.",
+      remediation: "Select a recognised strategy (e.g. blend-stable or aggressive-yield) and retry.",
+    });
+    if (targetProtocols.length === 0) {
+      targetProtocols = [PROTOCOLS[0]]; // fallback
+      baseApySum = targetProtocols[0].baseApyBps;
+    }
+  }
+
+  // Allocate proportionally based on APY (just a mock logic for simulation)
+  let allocated = 0;
+  let blendedApyBps = 0;
+
+  targetProtocols.forEach((p, index) => {
+    let allocAmount = 0;
+    if (index === targetProtocols.length - 1) {
+       allocAmount = netAmount - allocated;
+    } else {
+       allocAmount = netAmount * (p.baseApyBps / baseApySum);
+    }
+    allocated += allocAmount;
+    
+    // Weight APY
+    blendedApyBps += (p.baseApyBps * allocAmount) / netAmount;
+
+    result.allocations.push({
+      protocol: p.protocolName,
+      amount: allocAmount,
+      percentage: (allocAmount / amount) * 100, // percentage of *base* amount for clarity
+    });
+    
+    result.routing.path.push(p.protocolName);
+  });
+
+  // Contract: APY leaves this module as a percent at 2 decimals, exactly as the
+  // market feed publishes it. Emitting the raw quotient here is what made a
+  // single-protocol deposit preview disagree with /api/yields in the third
+  // decimal.
+  result.postDepositExposure.expectedApy = normalizeApyPercent(
+    bpsToApyPercent(blendedApyBps),
+  );
+
+  // Assuming 1 token = 1 share for simplicity, with some small slippage loss mock
+  const slippageLoss = amount > 100000 ? netAmount * 0.01 : netAmount * 0.001;
+  result.expectedShares = netAmount - slippageLoss;
+  result.routing.expectedOutput = result.expectedShares;
+
+  return result;
+}
+
+// ── Yield bounds (#1407) ────────────────────────────────────────────────
+//
+// Yields can be negative: a depeg, a slashing event, an impermanent-loss
+// drawdown or a strategy that costs more than it earns all shrink principal.
+// The simulators used to reject any APY below zero, so a user could not
+// model the very periods they most need to understand.
+
+/**
+ * Lowest annualised APY accepted as a standing assumption: a total loss over
+ * a year. Anything lower is not a meaningful long-run rate — use a
+ * `dailyApy` series to model a sharper, shorter loss.
+ */
+export const MIN_ANNUAL_APY_PCT = -100;
+
+/**
+ * Lowest APY accepted for a single day of a `dailyApy` series. Each day
+ * compounds by `1 + apy / 100 / 365`, so this is the point where that factor
+ * reaches zero: the allocation loses its whole value in one day. Below it the
+ * factor would go negative and a position could be worth less than nothing.
+ */
+export const MIN_DAILY_APY_PCT = -36_500;
+
+/** Returns the problem with an APY input, or `null` when it is acceptable. */
+function apyProblem(label: string, value: unknown, min: number): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return `apy for ${label} must be a finite number.`;
+  }
+  if (value < min) {
+    return `apy for ${label} must be at least ${min}% (got ${value}).`;
+  }
+  return null;
+}
+
+// ── Rebalance Simulation Sandbox ────────────────────────────────────────
+//
+// Previews the effect of moving from a current allocation to a target
+// allocation before any capital is committed: projected blended APY,
+// estimated turnover fees, and per-leg allocation drift, plus warnings for
+// high fees, stale data, and liquidity risk. Simulation-only — it never
+// executes a rebalance.
+
+export interface RebalanceAllocationInput {
+  label: string; // protocol / vault name
+  currentWeight: number; // 0-100, current share of the portfolio
+  targetWeight: number; // 0-100, desired share of the portfolio
+  apy: number; // annualized %, used for blended APY
+  liquidityUsd?: number; // available liquidity for this leg
+}
+
+export interface RebalanceParams {
+  totalValueUsd: number;
+  allocations: RebalanceAllocationInput[];
+  feeBps?: number; // turnover fee in bps (default 20 = 0.2%)
+  dataAgeSeconds?: number; // age of the market data feeding the preview
+  /**
+   * ISO-8601 timestamp of the market snapshot the preview's APY/liquidity
+   * inputs were sourced from. When omitted or invalid, the preview is
+   * treated as stale (see `SNAPSHOT_MISSING` / `SNAPSHOT_STALE`) rather than
+   * silently assumed fresh — a missing timestamp is not evidence of fresh
+   * data (issue #1149).
+   */
+  snapshotTimestamp?: string | null;
+}
+
+export interface RebalanceLeg {
+  label: string;
+  currentWeight: number;
+  targetWeight: number;
+  driftPct: number; // targetWeight - currentWeight (signed)
+  currentValueUsd: number;
+  targetValueUsd: number;
+  deltaUsd: number; // targetValue - currentValue (signed)
+}
+
+/**
+ * Freshness metadata for the market snapshot a simulator response was
+ * computed from (issue #1149). Always present on `RebalancePreview` so
+ * client result panels can render a stale-data warning state without
+ * re-deriving age from `dataAgeSeconds`/`snapshotTimestamp` themselves.
+ */
+export interface SnapshotFreshness {
+  /** Age of the market snapshot in milliseconds, or `null` when unknown. */
+  snapshotAgeMs: number | null;
+  /**
+   * True when the snapshot is older than `staleSnapshotThresholdMs`, OR when
+   * no valid snapshot timestamp/age was supplied at all. A missing timestamp
+   * is treated as stale, never as fresh.
+   */
+  isStale: boolean;
+  /** Threshold (ms) used to decide staleness, echoed back for the client. */
+  staleSnapshotThresholdMs: number;
+}
+
+export interface RebalancePreview {
+  isSimulationOnly: true;
+  legs: RebalanceLeg[];
+  blendedApyBefore: number;
+  blendedApyAfter: number;
+  apyDeltaPct: number;
+  totalTurnoverUsd: number; // capital that actually moves
+  estimatedFeeUsd: number;
+  maxDriftPct: number; // largest absolute drift across legs
+  snapshotFreshness: SnapshotFreshness;
+  warnings: SimulationWarning[];
+}
+
+export const REBALANCE_THRESHOLDS = {
+  defaultFeeBps: 20, // 0.2%
+  /** Warn when estimated fees exceed this fraction of portfolio value. */
+  highFeeRatio: 0.005, // 0.5%
+  /** Data older than this (seconds) is considered stale. */
+  staleDataSeconds: 30 * 60,
+  /** Warn when a buy leg consumes more than this fraction of its liquidity. */
+  liquidityUtilizationLimit: 0.5,
+  /** Weights are valid when their sum is within this tolerance of 100. */
+  weightSumTolerance: 0.5,
+} as const;
+
+// Emits at the yield normalization contract's precision and rounding rule, so
+// simulation output lines up with the market feed rather than with a private
+// `Math.round` that breaks ties differently for negative deltas. Used for both
+// percent and USD values, which the contract carries at the same 2 decimals.
+const round2 = (value: number): number => roundTo(value, 2);
+
+/** Largest peak-to-trough fall of `values`, as a positive percentage (0 when it never falls). */
+function maxDrawdownPct(values: number[]): number {
+  let peak = 0;
+  let worst = 0;
+  for (const value of values) {
+    if (value > peak) peak = value;
+    if (peak > 0) worst = Math.max(worst, ((peak - value) / peak) * 100);
+  }
+  return worst;
+}
+
+/**
+ * Compute snapshot freshness metadata for a rebalance preview (issue #1149).
+ *
+ * Prefers an explicit `snapshotTimestamp` (age computed against wall-clock
+ * `now`); falls back to caller-supplied `dataAgeSeconds` when no timestamp is
+ * given. When neither is present, or the timestamp fails to parse, the
+ * snapshot is reported as stale with an unknown age — a missing/invalid
+ * timestamp must never be silently treated as fresh.
+ */
+export function computeSnapshotFreshness(
+  params: Pick<RebalanceParams, "snapshotTimestamp" | "dataAgeSeconds">,
+  now: number = Date.now(),
+): SnapshotFreshness {
+  const staleSnapshotThresholdMs = REBALANCE_THRESHOLDS.staleDataSeconds * 1000;
+
+  let snapshotAgeMs: number | null = null;
+
+  if (params.snapshotTimestamp !== undefined && params.snapshotTimestamp !== null) {
+    const parsed = Date.parse(params.snapshotTimestamp);
+    if (!Number.isNaN(parsed)) {
+      snapshotAgeMs = Math.max(0, now - parsed);
+    }
+  } else if (
+    params.dataAgeSeconds !== undefined &&
+    Number.isFinite(params.dataAgeSeconds) &&
+    params.dataAgeSeconds >= 0
+  ) {
+    snapshotAgeMs = params.dataAgeSeconds * 1000;
+  }
+
+  const isStale = snapshotAgeMs === null || snapshotAgeMs > staleSnapshotThresholdMs;
+
+  return { snapshotAgeMs, isStale, staleSnapshotThresholdMs };
+}
+
+/**
+ * Validate rebalance inputs. Returns a list of human-readable errors; an
+ * empty array means the params are valid.
+ */
+export function validateRebalanceParams(params: RebalanceParams): string[] {
+  const errors: string[] = [];
+  const t = REBALANCE_THRESHOLDS;
+
+  if (!Number.isFinite(params.totalValueUsd) || params.totalValueUsd <= 0) {
+    errors.push("totalValueUsd must be a positive number.");
+  } else if (params.totalValueUsd > MAX_SIMULATION_DEPOSIT) {
+    errors.push(
+      `totalValueUsd exceeds the maximum supported simulation value of ${MAX_SIMULATION_DEPOSIT.toLocaleString()}.`,
+    );
+  }
+
+  if (!Array.isArray(params.allocations) || params.allocations.length === 0) {
+    errors.push("allocations must be a non-empty array.");
+    return errors;
+  }
+
+  if (
+    params.feeBps !== undefined &&
+    (!Number.isFinite(params.feeBps) || params.feeBps < 0)
+  ) {
+    errors.push("feeBps must be a non-negative number.");
+  }
+
+  let currentSum = 0;
+  let targetSum = 0;
+  for (const alloc of params.allocations) {
+    if (!alloc.label) {
+      errors.push("Each allocation needs a label.");
+    }
+    for (const [field, value] of [
+      ["currentWeight", alloc.currentWeight],
+      ["targetWeight", alloc.targetWeight],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0 || value > 100) {
+        errors.push(
+          `${field} for ${alloc.label || "allocation"} must be between 0 and 100.`,
+        );
+      }
+    }
+    const previewApyProblem = apyProblem(
+      alloc.label || "allocation",
+      alloc.apy,
+      MIN_ANNUAL_APY_PCT,
+    );
+    if (previewApyProblem) {
+      errors.push(previewApyProblem);
+    } else if (alloc.apy > 10_000) {
+      errors.push(
+        `apy for ${alloc.label || "allocation"} of ${alloc.apy}% is not a plausible assumption.`,
+      );
+    }
+    currentSum += alloc.currentWeight;
+    targetSum += alloc.targetWeight;
+  }
+
+  if (Math.abs(currentSum - 100) > t.weightSumTolerance) {
+    errors.push(`Current weights must sum to 100% (got ${round2(currentSum)}%).`);
+  }
+  if (Math.abs(targetSum - 100) > t.weightSumTolerance) {
+    errors.push(`Target weights must sum to 100% (got ${round2(targetSum)}%).`);
+  }
+
+  return errors;
+}
+
+/**
+ * Preview the effect of rebalancing from current to target allocations.
+ * @throws Error when params fail validation.
+ */
+export function simulateRebalance(params: RebalanceParams): RebalancePreview {
+  const errors = validateRebalanceParams(params);
+  if (errors.length > 0) {
+    throw new Error(`Invalid rebalance parameters: ${errors.join(" ")}`);
+  }
+
+  const t = REBALANCE_THRESHOLDS;
+  const { totalValueUsd, allocations } = params;
+  const feeBps = params.feeBps ?? t.defaultFeeBps;
+
+  let blendedApyBefore = 0;
+  let blendedApyAfter = 0;
+  let maxDriftPct = 0;
+  let grossMovement = 0;
+  const warnings: SimulationWarning[] = [];
+
+  const legs: RebalanceLeg[] = allocations.map((alloc) => {
+    const currentValueUsd = (totalValueUsd * alloc.currentWeight) / 100;
+    const targetValueUsd = (totalValueUsd * alloc.targetWeight) / 100;
+    const deltaUsd = targetValueUsd - currentValueUsd;
+    const driftPct = alloc.targetWeight - alloc.currentWeight;
+
+    blendedApyBefore += (alloc.apy * alloc.currentWeight) / 100;
+    blendedApyAfter += (alloc.apy * alloc.targetWeight) / 100;
+    maxDriftPct = Math.max(maxDriftPct, Math.abs(driftPct));
+
+    // Negative yield: capital held in this leg is expected to shrink.
+    if (alloc.apy < 0 && alloc.targetWeight > 0) {
+      warnings.push({
+        code: "NEGATIVE_YIELD_PERIOD",
+        severity: "warning",
+        affectedField: `allocations[${alloc.label}].apy`,
+        message: `${alloc.label} has a negative yield of ${alloc.apy}% APY; the ${round2(alloc.targetWeight)}% target weight is expected to lose value.`,
+        remediation: `Confirm the negative yield for ${alloc.label} is intended, or lower its target weight.`,
+      });
+    }
+    grossMovement += Math.abs(deltaUsd);
+
+    // Liquidity risk: a buy leg that consumes too much of its available pool.
+    if (
+      deltaUsd > 0 &&
+      alloc.liquidityUsd !== undefined &&
+      alloc.liquidityUsd >= 0 &&
+      deltaUsd > alloc.liquidityUsd * t.liquidityUtilizationLimit
+    ) {
+      warnings.push({
+        code: "LIQUIDITY_RISK",
+        severity: "warning",
+        affectedField: `allocations[${alloc.label}].liquidityUsd`,
+        message: `Liquidity risk: rebalancing into ${alloc.label} moves $${round2(deltaUsd)} against $${round2(alloc.liquidityUsd)} of liquidity.`,
+        remediation: `Reduce the target weight for ${alloc.label} or confirm that additional liquidity will be available before executing.`,
+      });
+    }
+
+    return {
+      label: alloc.label,
+      currentWeight: round2(alloc.currentWeight),
+      targetWeight: round2(alloc.targetWeight),
+      driftPct: round2(driftPct),
+      currentValueUsd: round2(currentValueUsd),
+      targetValueUsd: round2(targetValueUsd),
+      deltaUsd: round2(deltaUsd),
+    };
+  });
+
+  // Capital that actually moves is half the gross movement (buys == sells).
+  const totalTurnoverUsd = grossMovement / 2;
+  const estimatedFeeUsd = (totalTurnoverUsd * feeBps) / 10000;
+
+  if (estimatedFeeUsd > totalValueUsd * t.highFeeRatio) {
+    warnings.push({
+      code: "HIGH_FEES",
+      severity: "warning",
+      affectedField: "feeBps",
+      message: `High fees: estimated rebalance cost $${round2(estimatedFeeUsd)} exceeds ${t.highFeeRatio * 100}% of portfolio value.`,
+      remediation: "Lower the fee rate (feeBps) or reduce rebalance frequency to keep turnover costs manageable.",
+    });
+  }
+
+  const snapshotFreshness = computeSnapshotFreshness(params);
+
+  if (snapshotFreshness.isStale) {
+    if (snapshotFreshness.snapshotAgeMs === null) {
+      warnings.push({
+        code: "SNAPSHOT_MISSING",
+        severity: "warning",
+        affectedField: "snapshotTimestamp",
+        message:
+          "No market snapshot timestamp was supplied for this preview; treating it as stale until freshness can be confirmed.",
+        remediation: "Provide a snapshotTimestamp (or dataAgeSeconds) and re-run the simulation before committing any capital.",
+      });
+    } else {
+      warnings.push({
+        code: "STALE_DATA",
+        severity: "warning",
+        affectedField: "snapshotTimestamp",
+        message: `Stale data: preview uses a market snapshot ${Math.round(snapshotFreshness.snapshotAgeMs / 60000)}m old; refresh before committing.`,
+        remediation: "Refresh market data and re-run the simulation before committing any capital.",
+      });
+    }
+  }
+
+  return {
+    isSimulationOnly: true,
+    legs,
+    blendedApyBefore: round2(blendedApyBefore),
+    blendedApyAfter: round2(blendedApyAfter),
+    apyDeltaPct: round2(blendedApyAfter - blendedApyBefore),
+    totalTurnoverUsd: round2(totalTurnoverUsd),
+    estimatedFeeUsd: round2(estimatedFeeUsd),
+    maxDriftPct: round2(maxDriftPct),
+    snapshotFreshness,
+    warnings,
+  };
+}
+
+// ── Rebalance Backtest Engine ─────────────────────────────────────────────
+//
+// Simulates a historical rebalancing strategy (schedule or drift-threshold
+// based) day-by-day and compares against a passive hold benchmark.
+// Fully deterministic — same inputs always produce the same outputs.
+
+export interface RebalanceAllocationRule {
+  label: string;
+  targetWeight: number;   // 0-100, must sum to ~100 across all allocations
+  apy: number;            // annual % fallback / average, e.g. 10 = 10%; negative allowed down to MIN_ANNUAL_APY_PCT
+  /**
+   * Optional per-day APY series (length = backtest day count). Overrides `apy`
+   * for that day. Entries may be negative to model a loss period, down to
+   * `MIN_DAILY_APY_PCT`.
+   */
+  dailyApy?: number[];
+  liquidityUsd?: number;  // optional, for context only
+}
+
+export interface RebalanceBacktestParams {
+  initialValueUsd: number;
+  startDate: string;               // "YYYY-MM-DD"
+  endDate: string;                 // "YYYY-MM-DD"
+  allocations: RebalanceAllocationRule[];
+  strategy: 'schedule' | 'threshold';
+  rebalanceIntervalDays?: number;  // for schedule (default 30)
+  driftThresholdPct?: number;      // for threshold: max allowed weight drift (default 5)
+  feeBps?: number;                 // rebalance turnover fee in bps (default 20)
+}
+
+export interface RebalanceBacktestSnapshot {
+  date: string;
+  portfolioValue: number;   // rebalanced portfolio
+  passiveValue: number;     // passive benchmark (never rebalanced)
+  rebalanced: boolean;
+  blendedApyPct: number;   // weighted APY of current allocation
+}
+
+export interface RebalanceEvent {
+  date: string;
+  reason: string;
+  maxDriftPct: number;
+  feeUsd: number;
+}
+
+export interface RebalanceBacktestResult {
+  isSimulationOnly: true;
+  startDate: string;
+  endDate: string;
+  initialValueUsd: number;
+  finalPortfolioValue: number;
+  finalPassiveValue: number;
+  portfolioReturnPct: number;
+  passiveReturnPct: number;
+  outperformancePct: number;    // portfolio - passive return, expressed as % of initial
+  rebalanceCount: number;
+  totalFeesUsd: number;
+  /** Days on which the rebalanced portfolio's blended yield was negative. */
+  negativeYieldDays: number;
+  /** Largest peak-to-trough fall of the rebalanced portfolio, as a positive %. */
+  maxDrawdownPct: number;
+  /** Largest peak-to-trough fall of the passive benchmark, as a positive %. */
+  passiveMaxDrawdownPct: number;
+  snapshots: RebalanceBacktestSnapshot[];
+  rebalanceEvents: RebalanceEvent[];
+  warnings: SimulationWarning[];
+}
+
+export const BACKTEST_LIMITS = {
+  maxDays: 1825,      // 5 years
+  maxAllocations: 20,
+} as const;
+
+/**
+ * Validate backtest params. Returns array of error strings; empty means valid.
+ */
+export function validateRebalanceBacktestParams(params: RebalanceBacktestParams): string[] {
+  const errors: string[] = [];
+
+  if (!params.startDate || !params.endDate) {
+    errors.push("startDate and endDate are required.");
+  } else {
+    const start = new Date(params.startDate);
+    const end = new Date(params.endDate);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      errors.push("startDate and endDate must be valid ISO date strings.");
+    } else if (start >= end) {
+      if (start.getTime() === end.getTime()) {
+        errors.push("startDate and endDate cannot be identical (zero-length window).");
+      }
+      errors.push("startDate must be before endDate.");
+    } else {
+      const dayDiff = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+      if (dayDiff > BACKTEST_LIMITS.maxDays) {
+        errors.push(`Date range exceeds maximum of ${BACKTEST_LIMITS.maxDays} days.`);
+      }
+    }
+  }
+
+  if (params.rebalanceIntervalDays !== undefined && params.rebalanceIntervalDays !== null) {
+    if (
+      !Number.isFinite(params.rebalanceIntervalDays) ||
+      params.rebalanceIntervalDays <= 0 ||
+      !Number.isInteger(params.rebalanceIntervalDays)
+    ) {
+      errors.push("rebalanceIntervalDays must be a positive integer.");
+    } else if (params.rebalanceIntervalDays > BACKTEST_LIMITS.maxDays) {
+      errors.push(`rebalanceIntervalDays exceeds maximum allowed of ${BACKTEST_LIMITS.maxDays} days.`);
+    }
+  }
+
+  if (!Number.isFinite(params.initialValueUsd) || params.initialValueUsd <= 0) {
+    errors.push("initialValueUsd must be a positive number.");
+  }
+
+  if (!Array.isArray(params.allocations) || params.allocations.length === 0) {
+    errors.push("allocations must be a non-empty array.");
+    return errors;
+  }
+
+  if (params.allocations.length > BACKTEST_LIMITS.maxAllocations) {
+    errors.push(`Too many allocations (max ${BACKTEST_LIMITS.maxAllocations}).`);
+  }
+
+  let weightSum = 0;
+  for (const alloc of params.allocations) {
+    if (!alloc.label) errors.push("Each allocation must have a label.");
+    if (!Number.isFinite(alloc.targetWeight) || alloc.targetWeight < 0 || alloc.targetWeight > 100) {
+      errors.push(`targetWeight for "${alloc.label || 'allocation'}" must be 0-100.`);
+    }
+    const name = `"${alloc.label || "allocation"}"`;
+    const apyError = apyProblem(name, alloc.apy, MIN_ANNUAL_APY_PCT);
+    if (apyError) errors.push(apyError);
+
+    if (alloc.dailyApy !== undefined) {
+      if (!Array.isArray(alloc.dailyApy)) {
+        errors.push(`dailyApy for ${name} must be an array of numbers.`);
+      } else if (alloc.dailyApy.length > BACKTEST_LIMITS.maxDays + 1) {
+        errors.push(`dailyApy for ${name} has too many entries (max ${BACKTEST_LIMITS.maxDays + 1}).`);
+      } else {
+        const badIndex = alloc.dailyApy.findIndex(
+          (value) => apyProblem(name, value, MIN_DAILY_APY_PCT) !== null,
+        );
+        if (badIndex !== -1) {
+          errors.push(
+            `dailyApy[${badIndex}] for ${name} must be a finite number of at least ${MIN_DAILY_APY_PCT}% (got ${alloc.dailyApy[badIndex]}).`,
+          );
+        }
+      }
+    }
+    weightSum += alloc.targetWeight;
+  }
+
+  if (Math.abs(weightSum - 100) > 0.5) {
+    errors.push(`targetWeights must sum to 100 (got ${round2(weightSum)}).`);
+  }
+
+  if (params.strategy !== 'schedule' && params.strategy !== 'threshold') {
+    errors.push("strategy must be 'schedule' or 'threshold'.");
+  }
+
+  return errors;
+}
+
+/**
+ * Run a deterministic historical rebalance backtest.
+ * @throws Error when params fail validation.
+ */
+export function runRebalanceBacktest(params: RebalanceBacktestParams): RebalanceBacktestResult {
+  const errors = validateRebalanceBacktestParams(params);
+  if (errors.length > 0) {
+    throw new Error(`Invalid backtest parameters: ${errors.join(" ")}`);
+  }
+
+  const feeBps = params.feeBps ?? 20;
+  const rebalanceIntervalDays = params.rebalanceIntervalDays ?? 30;
+  const driftThresholdPct = params.driftThresholdPct ?? 5;
+
+  const targetWeights = params.allocations.map(a => a.targetWeight / 100);
+
+  const apyForDay = (alloc: RebalanceAllocationRule, dayIndex: number): number =>
+    alloc.dailyApy && alloc.dailyApy.length > dayIndex ? alloc.dailyApy[dayIndex] : alloc.apy;
+
+  // A negative yield shrinks the position; the factor is floored at zero so an
+  // allocation can lose all of its value in a day but never go below nothing.
+  const dailyFactorFor = (alloc: RebalanceAllocationRule, dayIndex: number): number =>
+    Math.max(0, 1 + apyForDay(alloc, dayIndex) / 100 / 365);
+
+  // Backtest-level structured warnings (evaluated once before the loop).
+  const warnings: SimulationWarning[] = [];
+
+  // Warn when the requested interval means very few rebalances will occur (<2)
+  // for a schedule strategy — results may not be meaningful.
+  if (params.strategy === 'schedule') {
+    const start = new Date(params.startDate).getTime();
+    const end = new Date(params.endDate).getTime();
+    const totalDays = Math.round((end - start) / 86_400_000);
+    const expectedRebalances = Math.floor(totalDays / rebalanceIntervalDays);
+    if (expectedRebalances < 2) {
+      warnings.push({
+        code: "UNSUPPORTED_INTERVAL",
+        severity: "info",
+        affectedField: "rebalanceIntervalDays",
+        message: `The rebalance interval of ${rebalanceIntervalDays} days leaves fewer than 2 rebalances in the selected date range. Results may not be representative.`,
+        remediation: "Shorten the rebalance interval or extend the backtest date range for a more meaningful comparison.",
+      });
+    }
+  }
+
+  // Warn when any allocation has a suspiciously high APY (potential data error).
+  const HIGH_VOLATILITY_APY_THRESHOLD = 200; // >200% annualised APY
+  for (const alloc of params.allocations) {
+    if (alloc.apy > HIGH_VOLATILITY_APY_THRESHOLD) {
+      warnings.push({
+        code: "HIGH_VOLATILITY",
+        severity: "warning",
+        affectedField: `allocations[${alloc.label}].apy`,
+        message: `APY of ${alloc.apy}% for "${alloc.label}" is unusually high and may indicate volatile or unreliable yield data.`,
+        remediation: "Verify the APY input for this allocation. Extremely high yields often reflect short-lived anomalies or data errors.",
+      });
+    }
+  }
+
+  // Warn about every allocation that earns a negative yield during the window.
+  const simulatedDays =
+    Math.round((new Date(params.endDate).getTime() - new Date(params.startDate).getTime()) / 86_400_000) + 1;
+  for (const alloc of params.allocations) {
+    let negativeDays = 0;
+    let worstApy = 0;
+    for (let day = 0; day < simulatedDays; day++) {
+      const apy = apyForDay(alloc, day);
+      if (apy < 0) {
+        negativeDays++;
+        worstApy = Math.min(worstApy, apy);
+      }
+    }
+    if (negativeDays > 0) {
+      const field = alloc.dailyApy && alloc.dailyApy.some((v) => v < 0) ? "dailyApy" : "apy";
+      warnings.push({
+        code: "NEGATIVE_YIELD_PERIOD",
+        severity: "warning",
+        affectedField: `allocations[${alloc.label}].${field}`,
+        message: `"${alloc.label}" earns a negative yield on ${negativeDays} of ${simulatedDays} simulated days (worst ${round2(worstApy)}% APY); its value shrinks on those days.`,
+        remediation: `Confirm the negative yield for "${alloc.label}" is intended, e.g. a depeg, slashing or loss event. Performance fees apply only to positive yield, so none are charged on these days.`,
+      });
+    }
+  }
+
+  // Warn when the total fee cost across the whole backtest is large relative to
+  // initial portfolio value. We approximate using max possible turnover.
+  const estimatedMaxFeeFraction = (feeBps / 10_000) * (365 / rebalanceIntervalDays);
+  if (estimatedMaxFeeFraction > 0.05) {
+    warnings.push({
+      code: "HIGH_FEES",
+      severity: "warning",
+      affectedField: "feeBps",
+      message: `At ${feeBps} bps per rebalance and an interval of ${rebalanceIntervalDays} days, annual fee drag could exceed 5% of portfolio value.`,
+      remediation: "Increase the rebalance interval or reduce feeBps to keep drag manageable.",
+    });
+  }
+
+  // Per-allocation values for the rebalanced portfolio and the passive benchmark
+  let portfolioAlloc = targetWeights.map(w => params.initialValueUsd * w);
+  let passiveAlloc = [...portfolioAlloc];
+
+  const snapshots: RebalanceBacktestSnapshot[] = [];
+  const rebalanceEvents: RebalanceEvent[] = [];
+  const portfolioSeries: number[] = [];
+  const passiveSeries: number[] = [];
+  let negativeYieldDays = 0;
+  let totalFeesUsd = 0;
+  let dayNumber = 0;
+
+  const startMs = new Date(params.startDate).getTime();
+  const endMs = new Date(params.endDate).getTime();
+
+  for (let ms = startMs; ms <= endMs; ms += 86_400_000) {
+    const dateStr = new Date(ms).toISOString().slice(0, 10);
+
+    // Compound growth for each allocation
+    portfolioAlloc = portfolioAlloc.map((v, i) => v * dailyFactorFor(params.allocations[i], dayNumber));
+    passiveAlloc = passiveAlloc.map((v, i) => v * dailyFactorFor(params.allocations[i], dayNumber));
+
+    const totalPortfolio = portfolioAlloc.reduce((s, v) => s + v, 0);
+    // A portfolio that has lost everything has no weights to drift from.
+    const currentWeights =
+      totalPortfolio > 0
+        ? portfolioAlloc.map(v => (v / totalPortfolio) * 100)
+        : portfolioAlloc.map(() => 0);
+
+    // Determine whether a rebalance should occur today
+    let shouldRebalance = false;
+    let rebalanceReason = '';
+    let maxDrift = 0;
+
+    if (totalPortfolio <= 0) {
+      // Nothing left to rebalance.
+    } else if (params.strategy === 'schedule') {
+      if (dayNumber > 0 && dayNumber % rebalanceIntervalDays === 0) {
+        shouldRebalance = true;
+        rebalanceReason = `Scheduled rebalance every ${rebalanceIntervalDays} days`;
+      }
+    } else {
+      const drifts = params.allocations.map((a, i) =>
+        Math.abs(currentWeights[i] - a.targetWeight),
+      );
+      maxDrift = Math.max(...drifts);
+      if (maxDrift > driftThresholdPct) {
+        shouldRebalance = true;
+        rebalanceReason = `Max weight drift ${round2(maxDrift)}% exceeded ${driftThresholdPct}% threshold`;
+      }
+    }
+
+    let feeToday = 0;
+    if (shouldRebalance) {
+      const targetValues = targetWeights.map(w => totalPortfolio * w);
+      const grossMovement = portfolioAlloc.reduce(
+        (s, v, i) => s + Math.abs(v - targetValues[i]),
+        0,
+      );
+      const turnover = grossMovement / 2;
+      feeToday = (turnover * feeBps) / 10_000;
+      totalFeesUsd += feeToday;
+
+      const valueAfterFee = totalPortfolio - feeToday;
+      portfolioAlloc = targetWeights.map(w => valueAfterFee * w);
+
+      rebalanceEvents.push({
+        date: dateStr,
+        reason: rebalanceReason,
+        maxDriftPct: round2(maxDrift),
+        feeUsd: round2(feeToday),
+      });
+    }
+
+    const portfolioTotal = portfolioAlloc.reduce((s, v) => s + v, 0);
+    const passiveTotal = passiveAlloc.reduce((s, v) => s + v, 0);
+    const blendedApy =
+      portfolioTotal > 0
+        ? params.allocations.reduce(
+            (sum, a, i) => sum + apyForDay(a, dayNumber) * (portfolioAlloc[i] / portfolioTotal),
+            0,
+          )
+        : 0;
+    if (blendedApy < 0) negativeYieldDays++;
+    portfolioSeries.push(portfolioTotal);
+    passiveSeries.push(passiveTotal);
+
+    snapshots.push({
+      date: dateStr,
+      portfolioValue: round2(portfolioTotal),
+      passiveValue: round2(passiveTotal),
+      rebalanced: shouldRebalance,
+      blendedApyPct: round2(blendedApy),
+    });
+
+    dayNumber++;
+  }
+
+  const last = snapshots[snapshots.length - 1];
+  const finalPortfolio = last?.portfolioValue ?? params.initialValueUsd;
+  const finalPassive = last?.passiveValue ?? params.initialValueUsd;
+  const init = params.initialValueUsd;
+
+  if (finalPortfolio < init) {
+    warnings.push({
+      code: "CAPITAL_LOSS",
+      severity: "warning",
+      affectedField: "allocations",
+      message: `The rebalanced portfolio ends ${round2(((init - finalPortfolio) / init) * 100)}% below its starting value of $${round2(init)}.`,
+      remediation: "Review the yield assumptions and allocation weights; negative yields and rebalance fees both reduce principal.",
+    });
+  }
+
+  return {
+    isSimulationOnly: true,
+    startDate: params.startDate,
+    endDate: params.endDate,
+    initialValueUsd: init,
+    finalPortfolioValue: round2(finalPortfolio),
+    finalPassiveValue: round2(finalPassive),
+    portfolioReturnPct: round2(((finalPortfolio - init) / init) * 100),
+    passiveReturnPct: round2(((finalPassive - init) / init) * 100),
+    outperformancePct: round2(((finalPortfolio - finalPassive) / init) * 100),
+    rebalanceCount: rebalanceEvents.length,
+    totalFeesUsd: round2(totalFeesUsd),
+    negativeYieldDays,
+    maxDrawdownPct: round2(maxDrawdownPct(portfolioSeries)),
+    passiveMaxDrawdownPct: round2(maxDrawdownPct(passiveSeries)),
+    snapshots,
+    rebalanceEvents,
+    warnings,
+  };
+}

@@ -1,0 +1,1186 @@
+import { useEffect, useState, useCallback } from "react";
+import { useReducedMotion } from "../../hooks/useReducedMotion";
+import { useStaleResponseGuard } from "../../hooks/useStaleResponseGuard";
+import { FeeAssumptionsModal } from "../FeeAssumptionsModal";
+import {
+  BarChart3,
+  ArrowUpRight,
+  ArrowDownRight,
+  RefreshCw,
+  AlertTriangle,
+  Search,
+  SlidersHorizontal,
+  TrendingUp,
+  ShieldCheck,
+  Flame,
+  ChevronDown,
+  ExternalLink,
+  Layers,
+  Clock,
+  Info,
+  Rows3,
+  Grid2x2,
+  Maximize2,
+} from "lucide-react";
+import { apiUrl } from "../../lib/api";
+import { BackendUnavailable } from "../BackendUnavailable";
+import { stableSort } from "../../lib/stableSort";
+import EmptyState from "../common/EmptyState";
+import { EMPTY_STATE_APY } from "../../utils/emptyStateCopy";
+import { LiquidityBufferPanel } from "./LiquidityBufferPanel";
+import { FreshnessBanner } from "./FreshnessBanner";
+import { computeDecayedFreshnessConfidence } from "./freshnessDecay";
+import { RISK_EXPLANATIONS, RiskLevel } from "../../config/riskConfig";
+import { VaultRiskBadge } from "../common/VaultRiskBadge";
+import { useDensity } from "../../context/DensityContext";
+import type { DensityMode } from "../../context/DensityContext";
+import { cachedFetch } from "../../lib/cachedFetch";
+import { formatRewardRate } from "../../lib/apyFormat";
+import { getYieldSourceFreshness } from "./yieldSourceFreshness";
+
+// ── Types ───────────────────────────────────────────────────────────────
+
+interface ApyEntry {
+  protocol: string;
+  asset: string;
+  apy: number;
+  totalApy?: number;
+  netApy?: number;
+  feeDragApy?: number;
+  netYieldSensitivity?: Array<{
+    environment: "low" | "medium" | "high";
+    netApy: number;
+  }>;
+  feeAttribution?: {
+    managementFeeApy: number;
+    protocolFeeApy: number;
+    slippageApy: number;
+    networkFeeApy: number;
+    rewardOffsetApy: number;
+    unknownFeeApy: number;
+    totalFeeDragApy: number;
+  };
+  capitalEfficiency?: {
+    score: number;
+    grade: "A" | "B" | "C" | "D";
+  };
+  tvl: number;
+  risk: string;
+  change24h: number;
+  rewardTokens: string[];
+  category: string;
+  fetchedAt?: string;
+  isStale?: boolean;
+  freshnessConfidence?: number;
+  unusableDueToStale?: boolean;
+}
+
+type SortField = "apy" | "tvl" | "risk" | "protocol";
+type SortDirection = "asc" | "desc";
+type ViewMode = "grid" | "table";
+
+const SORT_LABELS: Record<SortField, string> = {
+  protocol: "Protocol",
+  apy: "APY",
+  tvl: "TVL",
+  risk: "Risk",
+};
+
+interface ApiApyEntry {
+  protocol?: unknown;
+  asset?: unknown;
+  apy?: unknown;
+  tvl?: unknown;
+  risk?: unknown;
+  change24h?: unknown;
+  rewardTokens?: unknown;
+  category?: unknown;
+  fetchedAt?: unknown;
+  isStale?: unknown;
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+function formatTvl(value: number): string {
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `$${(value / 1_000).toFixed(1)}K`;
+  return `$${value.toLocaleString()}`;
+}
+
+const PROTOCOL_COLORS: Record<string, string> = {
+  Blend: "from-violet-500/80 to-indigo-600/80",
+  Soroswap: "from-cyan-500/80 to-blue-600/80",
+  DeFindex: "from-amber-500/80 to-orange-600/80",
+  Aquarius: "from-emerald-500/80 to-teal-600/80",
+};
+
+function normalizeNumber(value: unknown, fallback = 0): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeRisk(value: unknown): RiskLevel {
+  return value === "Low" || value === "Medium" || value === "High"
+    ? value
+    : "Medium";
+}
+
+function deriveCategory(protocol: string): string {
+  if (protocol === "Soroswap") return "DEX LP";
+  if (protocol === "Blend") return "Lending";
+  if (protocol === "Aquarius") return "Staking";
+  if (protocol === "DeFindex") return "Index";
+  return "Other";
+}
+
+function normalizeFetchedAt(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : value;
+}
+
+function normalizeRewardTokens(tokens: unknown, protocol: string): string[] {
+  if (Array.isArray(tokens)) {
+    const cleaned = tokens.filter(
+      (token): token is string =>
+        typeof token === "string" && token.trim().length > 0,
+    );
+    if (cleaned.length > 0) return cleaned;
+  }
+  return [protocol.slice(0, 4).toUpperCase()];
+}
+
+function normalizeApyEntry(entry: ApiApyEntry): ApyEntry {
+  const protocol =
+    typeof entry.protocol === "string" && entry.protocol.trim().length > 0
+      ? entry.protocol
+      : "Unknown Protocol";
+  const asset =
+    typeof entry.asset === "string" && entry.asset.trim().length > 0
+      ? entry.asset
+      : "Unknown Asset";
+
+  return {
+    protocol,
+    asset,
+    apy: normalizeNumber(entry.apy),
+    tvl: normalizeNumber(entry.tvl),
+    risk: normalizeRisk(entry.risk),
+    change24h: normalizeNumber(
+      entry.change24h,
+      parseFloat((Math.random() * 4 - 1).toFixed(2)),
+    ),
+    rewardTokens: normalizeRewardTokens(entry.rewardTokens, protocol),
+    category:
+      typeof entry.category === "string" && entry.category.trim().length > 0
+        ? entry.category
+        : deriveCategory(protocol),
+    fetchedAt: normalizeFetchedAt(entry.fetchedAt),
+    isStale: typeof entry.isStale === "boolean" ? entry.isStale : undefined,
+  };
+}
+
+function getErrorMessage(error: unknown): string {
+  return "Unable to fetch live APY data right now. The backend service may be disconnected.";
+}
+
+function getSortButtonLabel(
+  field: SortField,
+  activeField: SortField,
+  direction: SortDirection,
+): string {
+  const label = SORT_LABELS[field];
+  if (field !== activeField) return `Sort by ${label} descending`;
+
+  const currentDirection = direction === "asc" ? "ascending" : "descending";
+  const nextDirection = direction === "asc" ? "descending" : "ascending";
+  return `${label} sorted ${currentDirection}; activate to sort ${nextDirection}`;
+}
+
+function getAriaSort(
+  field: SortField,
+  activeField: SortField,
+  direction: SortDirection,
+): "ascending" | "descending" | "none" {
+  if (field !== activeField) return "none";
+  return direction === "asc" ? "ascending" : "descending";
+}
+
+function getApyRowId(entry: ApyEntry): string {
+  return `${entry.protocol}-${entry.asset}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+// ── Skeleton Components ─────────────────────────────────────────────────
+
+function SkeletonCard() {
+  const reducedMotion = useReducedMotion();
+  return (
+    <div className={`glass-card p-6 ${reducedMotion ? "" : "animate-pulse"}`}>
+      <div className="flex items-center gap-3 mb-5">
+        <div className="w-10 h-10 rounded-xl bg-white/5"></div>
+        <div className="space-y-2 flex-1">
+          <div className="h-4 bg-white/5 rounded-lg w-24"></div>
+          <div className="h-3 bg-white/5 rounded-lg w-16"></div>
+        </div>
+      </div>
+      <div className="h-8 bg-white/5 rounded-lg w-20 mb-3"></div>
+      <div className="flex gap-4 mt-4">
+        <div className="h-3 bg-white/5 rounded-lg w-16"></div>
+        <div className="h-3 bg-white/5 rounded-lg w-20"></div>
+      </div>
+      <div className="h-9 bg-white/5 rounded-lg w-full mt-5"></div>
+    </div>
+  );
+}
+
+function SkeletonTableRow() {
+  const reducedMotion = useReducedMotion();
+  return (
+    <tr className={reducedMotion ? "" : "animate-pulse"}>
+      <td className="px-6 py-5">
+        <div className="h-4 bg-white/5 rounded-lg w-20"></div>
+      </td>
+      <td className="px-6 py-5">
+        <div className="h-6 bg-white/5 rounded-full w-24"></div>
+      </td>
+      <td className="px-6 py-5">
+        <div className="h-5 bg-white/5 rounded-lg w-16"></div>
+      </td>
+      <td className="px-6 py-5">
+        <div className="h-4 bg-white/5 rounded-lg w-20"></div>
+      </td>
+      <td className="px-6 py-5">
+        <div className="h-5 bg-white/5 rounded-lg w-14"></div>
+      </td>
+      <td className="px-6 py-5">
+        <div className="h-4 bg-white/5 rounded-lg w-12"></div>
+      </td>
+      <td className="px-6 py-5 text-right">
+        <div className="h-8 bg-white/5 rounded-lg w-20 ml-auto"></div>
+      </td>
+    </tr>
+  );
+}
+
+function SkeletonSummary() {
+  const reducedMotion = useReducedMotion();
+  return (
+    <div
+      className={`grid grid-cols-1 md:grid-cols-4 gap-4 ${reducedMotion ? "" : "animate-pulse"}`}
+    >
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="glass-card p-5">
+          <div className="h-3 bg-white/5 rounded-lg w-24 mb-3"></div>
+          <div className="h-7 bg-white/5 rounded-lg w-20"></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Main Component ──────────────────────────────────────────────────────
+
+export default function ApyDashboard() {
+  const reducedMotion = useReducedMotion();
+  const { density, setDensity } = useDensity();
+  const [isFeeModalOpen, setIsFeeModalOpen] = useState(false);
+  const [apyData, setApyData] = useState<ApyEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortField, setSortField] = useState<SortField>("apy");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [selectedCategory, setSelectedCategory] = useState<string>("All");
+  const [refreshing, setRefreshing] = useState(false);
+  const [cacheIndicator, setCacheIndicator] = useState<
+    "offline" | "cached" | null
+  >(null);
+  const [cacheFetchedAt, setCacheFetchedAt] = useState<number | null>(null);
+  const { startRequest, isCurrent } = useStaleResponseGuard();
+
+  const fetchApyData = useCallback(async (showLoadingState = true) => {
+    const token = startRequest();
+
+    if (showLoadingState) {
+      setLoading(true);
+    }
+
+    try {
+      setError(null);
+      const result = await cachedFetch<unknown>(apiUrl("/api/yields"));
+      if (!isCurrent(token)) return;
+      if (result.data == null) {
+        setError(
+          result.error
+            ? getErrorMessage(new Error(result.error))
+            : "Unable to fetch live APY data right now",
+        );
+        setApyData([]);
+        setCacheIndicator(null);
+        setCacheFetchedAt(null);
+      } else {
+        const rows = Array.isArray(result.data) ? result.data : [];
+        const augmented: ApyEntry[] = rows.map((row) => {
+          const entry = normalizeApyEntry(row as ApiApyEntry);
+          const fetchedTime = entry.fetchedAt
+            ? Date.parse(entry.fetchedAt)
+            : Date.now();
+          const freshness = computeDecayedFreshnessConfidence(
+            Date.now() - fetchedTime,
+          );
+          return {
+            ...entry,
+            freshnessConfidence: freshness.confidence,
+            unusableDueToStale: freshness.unusable,
+          };
+        });
+        setApyData(augmented);
+        setCacheIndicator(
+          result.offline ? "offline" : result.fromCache ? "cached" : null,
+        );
+        setCacheFetchedAt(result.fetchedAt);
+        setError(null);
+      }
+    } catch (err) {
+      if (!isCurrent(token)) return;
+      setError(getErrorMessage(err));
+      setApyData([]);
+      setCacheIndicator(null);
+    } finally {
+      if (isCurrent(token)) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
+  }, [startRequest, isCurrent]);
+
+  useEffect(() => {
+    void fetchApyData();
+  }, [fetchApyData]);
+
+  // Auto-refresh cached rates when connectivity returns (#1125).
+  useEffect(() => {
+    const handleOnline = () => {
+      void fetchApyData(false);
+    };
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, [fetchApyData]);
+
+  const handleRefresh = () => {
+    setRefreshing(true);
+    void fetchApyData(false);
+  };
+
+  // ── Derived state ───────────────────────────────────────────────────
+
+  const categories = [
+    "All",
+    ...Array.from(new Set(apyData.map((d) => d.category))).sort((a, b) =>
+      a.localeCompare(b),
+    ),
+  ];
+
+  // Deterministic ordering (#1118): primary key first, then a final
+  // direction-independent tiebreak on the unique protocol-asset row id so
+  // equal-value rows keep the same order across refreshes regardless of
+  // backend response order.
+  const filtered = stableSort(
+    apyData.filter((d) => {
+      if (d.unusableDueToStale) return false;
+      const q = searchQuery.toLowerCase();
+      const matchesSearch =
+        d.protocol.toLowerCase().includes(q) ||
+        d.asset.toLowerCase().includes(q) ||
+        d.category.toLowerCase().includes(q);
+      const matchesCategory =
+        selectedCategory === "All" || d.category === selectedCategory;
+      return matchesSearch && matchesCategory;
+    }),
+    (a, b) => {
+      const dir = sortDirection === "asc" ? 1 : -1;
+      if (sortField === "protocol")
+        return dir * a.protocol.localeCompare(b.protocol);
+      if (sortField === "risk")
+        return (
+          dir *
+          ((RISK_EXPLANATIONS[a.risk as RiskLevel]?.order ?? 0) -
+            (RISK_EXPLANATIONS[b.risk as RiskLevel]?.order ?? 0))
+        );
+      const scoreA = (a[sortField] as number) * (a.freshnessConfidence ?? 1);
+      const scoreB = (b[sortField] as number) * (b.freshnessConfidence ?? 1);
+      return dir * (scoreA - scoreB);
+    },
+    getApyRowId,
+  );
+
+  const bestApy = apyData.length
+    ? Math.max(...apyData.map((d) => d.netApy ?? d.apy))
+    : 0;
+  const avgApy = apyData.length
+    ? apyData.reduce((s, d) => s + (d.netApy ?? d.apy), 0) / apyData.length
+    : 0;
+  const totalTvl = apyData.reduce((s, d) => s + d.tvl, 0);
+  const protocolCount = new Set(apyData.map((d) => d.protocol)).size;
+  const feeAttributionRows = stableSort(
+    apyData.map((entry) => ({
+      id: getApyRowId(entry),
+      vault: entry.protocol,
+      totalFeeDragApy:
+        entry.feeAttribution?.totalFeeDragApy ?? entry.feeDragApy ?? 0,
+      managementFeeApy: entry.feeAttribution?.managementFeeApy ?? 0,
+      protocolFeeApy: entry.feeAttribution?.protocolFeeApy ?? 0,
+      slippageApy: entry.feeAttribution?.slippageApy ?? 0,
+      networkFeeApy: entry.feeAttribution?.networkFeeApy ?? 0,
+      rewardOffsetApy: entry.feeAttribution?.rewardOffsetApy ?? 0,
+      unknownFeeApy: entry.feeAttribution?.unknownFeeApy ?? 0,
+    })),
+    (a, b) => a.vault.localeCompare(b.vault),
+    (row) => row.id,
+  );
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === "asc" ? "desc" : "asc");
+    } else {
+      setSortField(field);
+      setSortDirection("desc");
+    }
+  };
+
+  const SortIcon = ({ field }: { field: SortField }) => (
+    <ChevronDown
+      size={14}
+      aria-hidden="true"
+      className={`inline-block ml-1 transition-transform ${
+        sortField === field ? "opacity-100" : "opacity-0 group-hover:opacity-50"
+      } ${sortField === field && sortDirection === "asc" ? "rotate-180" : ""}`}
+    />
+  );
+
+  // ── Error state ───────────────────────────────────────────────────
+
+  if (error && !apyData.length) {
+    return (
+      <div
+        className={`space-y-8 ${reducedMotion ? "" : "animate-in fade-in slide-in-from-bottom-4 duration-700"}`}
+      >
+        <header className="mb-6">
+          <h2 className="text-4xl font-extrabold tracking-tight mb-2">
+            APY Comparison
+          </h2>
+          <p className="text-gray-400">
+            Compare yields across Stellar DeFi protocols
+          </p>
+        </header>
+        <BackendUnavailable
+          featureName="APY Data"
+          reason="The backend service is currently disconnected or unavailable. Please try again later."
+          onRetry={handleRefresh}
+        />
+      </div>
+    );
+  }
+
+  // ── Render ────────────────────────────────────────────────────────
+
+  return (
+    <div
+      className={`space-y-8 ${reducedMotion ? "" : "animate-in fade-in slide-in-from-bottom-4 duration-700"}`}
+    >
+      {/* Header */}
+      <header className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-3 mb-2">
+            <div className="bg-[#6C5DD3]/20 p-2.5 rounded-xl">
+              <BarChart3 size={22} className="text-[#6C5DD3]" />
+            </div>
+            <h2 className="text-4xl font-extrabold tracking-tight">
+              APY Comparison
+            </h2>
+          </div>
+          <p className="text-gray-400 ml-[52px]">
+            Real-time yield rates across Stellar DeFi protocols
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={refreshing}
+          className="btn-secondary flex items-center gap-2 text-sm self-start md:self-auto disabled:opacity-50"
+        >
+          <RefreshCw
+            size={14}
+            className={refreshing && !reducedMotion ? "animate-spin" : ""}
+          />
+          {refreshing ? "Refreshing..." : "Refresh Rates"}
+        </button>
+      </header>
+
+      {cacheIndicator && apyData.length > 0 && (
+        <FreshnessBanner
+          lastUpdated={
+            cacheFetchedAt != null
+              ? new Date(cacheFetchedAt).toISOString()
+              : undefined
+          }
+          source="cache"
+          isOffline={cacheIndicator === "offline"}
+          onRefresh={handleRefresh}
+        />
+      )}
+
+      {error && (
+        <div
+          className="glass-panel border border-amber-500/30 bg-amber-500/10 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+          role="status"
+        >
+          <div className="flex items-start gap-2 text-amber-200">
+            <AlertTriangle size={16} className="mt-0.5" />
+            <p className="text-sm">
+              Live APY refresh failed. Showing the last available rates.
+            </p>
+          </div>
+          <button
+            onClick={handleRefresh}
+            className="btn-secondary inline-flex items-center gap-2 text-sm self-start sm:self-auto"
+          >
+            <RefreshCw
+              size={14}
+              className={refreshing && !reducedMotion ? "animate-spin" : ""}
+            />
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Summary Stats */}
+      {loading ? (
+        <div>
+          <p className="text-sm text-gray-400 mb-3" role="status">
+            Loading latest APY data...
+          </p>
+          <SkeletonSummary />
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="glass-card p-5 border-l-4 border-[#6C5DD3]">
+            <div className="flex items-center gap-2 text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">
+              <Flame size={14} /> Best APY
+            </div>
+            <p className="text-2xl font-bold text-[#3EAC75]">
+              {formatRewardRate(bestApy)}
+            </p>
+            <p className="text-xs text-gray-500 mt-1">
+              Net after fees/slippage
+            </p>
+          </div>
+          <div className="glass-card p-5 border-l-4 border-green-500">
+            <div className="flex items-center gap-2 text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">
+              <TrendingUp size={14} /> Avg APY
+            </div>
+            <p className="text-2xl font-bold">{formatRewardRate(avgApy)}</p>
+            <p className="text-xs text-gray-500 mt-1">
+              Portfolio net APY average
+            </p>
+          </div>
+          <div className="glass-card p-5 border-l-4 border-cyan-500">
+            <div className="flex items-center gap-2 text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">
+              <Layers size={14} /> Total TVL
+            </div>
+            <p className="text-2xl font-bold">{formatTvl(totalTvl)}</p>
+          </div>
+          <div className="glass-card p-5 border-l-4 border-amber-500">
+            <div className="flex items-center gap-2 text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">
+              <ShieldCheck size={14} /> Protocols
+            </div>
+            <p className="text-2xl font-bold">{protocolCount}</p>
+          </div>
+        </div>
+      )}
+
+      {!loading && feeAttributionRows.length > 0 && (
+        <section className="glass-panel p-5">
+          <div className="mb-3">
+            <div className="flex items-center gap-2">
+              <h3 className="text-lg font-semibold">
+                Cross-Vault Fee Attribution
+              </h3>
+              <button
+                onClick={() => setIsFeeModalOpen(true)}
+                className="text-gray-400 hover:text-white transition-colors cursor-pointer"
+                aria-label="View fee assumptions"
+              >
+                <Info size={16} />
+              </button>
+            </div>
+            <p className="text-xs text-gray-400">
+              Comparative fee drag by management, protocol, slippage, network,
+              reward offsets, and unknown components.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-gray-400">
+                  <th className="py-2 text-left">Vault</th>
+                  <th className="py-2 text-right">Total Drag</th>
+                  <th className="py-2 text-right">Mgmt</th>
+                  <th className="py-2 text-right">Protocol</th>
+                  <th className="py-2 text-right">Slippage</th>
+                  <th className="py-2 text-right">Network</th>
+                  <th className="py-2 text-right">Reward Offset</th>
+                  <th className="py-2 text-right">Unknown</th>
+                </tr>
+              </thead>
+              <tbody>
+                {feeAttributionRows.map((row) => (
+                  <tr key={row.id} className="border-t border-white/10">
+                    <td className="py-2">{row.vault}</td>
+                    <td className="py-2 text-right text-red-300">
+                      {formatRewardRate(row.totalFeeDragApy)}
+                    </td>
+                    <td className="py-2 text-right">
+                      {formatRewardRate(row.managementFeeApy)}
+                    </td>
+                    <td className="py-2 text-right">
+                      {formatRewardRate(row.protocolFeeApy)}
+                    </td>
+                    <td className="py-2 text-right">
+                      {formatRewardRate(row.slippageApy)}
+                    </td>
+                    <td className="py-2 text-right">
+                      {formatRewardRate(row.networkFeeApy)}
+                    </td>
+                    <td className="py-2 text-right text-green-300">
+                      -{formatRewardRate(row.rewardOffsetApy)}
+                    </td>
+                    <td className="py-2 text-right">
+                      {row.unknownFeeApy > 0
+                        ? formatRewardRate(row.unknownFeeApy)
+                        : "Unknown / None"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {/* Toolbar: Search + Filters + View Toggle */}
+      <div className="flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+        <div className="flex flex-wrap gap-3 items-center">
+          {/* Search */}
+          <div className="relative">
+            <Search
+              size={16}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500"
+            />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search protocol or asset..."
+              className="bg-white/5 border border-white/10 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[#6C5DD3]/50 focus:ring-1 focus:ring-[#6C5DD3]/30 transition-all w-64"
+            />
+          </div>
+
+          {/* Category Filters */}
+          <div className="flex gap-2">
+            {categories.map((cat) => (
+              <button
+                key={cat}
+                onClick={() => setSelectedCategory(cat)}
+                className={`px-3.5 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider transition-all border ${
+                  selectedCategory === cat
+                    ? "bg-[#6C5DD3]/20 border-[#6C5DD3]/40 text-[#6C5DD3]"
+                    : "bg-white/5 border-white/5 text-gray-400 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* View Toggle */}
+        <div className="flex items-center gap-3">
+          {/* Density Toggle */}
+          <div className="glass-card flex overflow-hidden p-1 gap-1">
+            {(["compact", "comfortable", "spacious"] as DensityMode[]).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setDensity(mode)}
+                aria-pressed={density === mode}
+                aria-label={`${mode} density`}
+                className={`density-toggle px-2 py-1.5 rounded-lg text-[10px] font-semibold transition-all ${
+                  density === mode
+                    ? "bg-[#6C5DD3] text-white"
+                    : "text-gray-400 hover:text-white"
+                }`}
+                title={`${mode.charAt(0).toUpperCase() + mode.slice(1)} density`}
+              >
+                {mode === "compact" ? <Rows3 size={12} /> : mode === "spacious" ? <Maximize2 size={12} /> : <Grid2x2 size={12} />}
+              </button>
+            ))}
+          </div>
+
+          <div className="glass-card flex overflow-hidden p-1 gap-1">
+          <button
+            onClick={() => setViewMode("grid")}
+            aria-pressed={viewMode === "grid"}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+              viewMode === "grid"
+                ? "bg-[#6C5DD3] text-white"
+                : "text-gray-400 hover:text-white"
+            }`}
+          >
+            <SlidersHorizontal size={14} className="inline mr-1.5" />
+            Cards
+          </button>
+          <button
+            onClick={() => setViewMode("table")}
+            aria-pressed={viewMode === "table"}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+              viewMode === "table"
+                ? "bg-[#6C5DD3] text-white"
+                : "text-gray-400 hover:text-white"
+            }`}
+          >
+            <BarChart3 size={14} className="inline mr-1.5" />
+            Table
+          </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Card Grid View */}
+      {viewMode === "grid" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+          {loading
+            ? Array.from({ length: 8 }).map((_, i) => <SkeletonCard key={i} />)
+            : filtered.map((entry, i) => {
+                const gradient =
+                  PROTOCOL_COLORS[entry.protocol] ??
+                  "from-gray-500/80 to-gray-600/80";
+                const isPositive = entry.change24h >= 0;
+
+                const freshness = getYieldSourceFreshness(entry);
+
+                return (
+                  <div
+                    key={`${entry.protocol}-${entry.asset}`}
+                    className="glass-card p-6 flex flex-col justify-between group"
+                    style={
+                      reducedMotion ? {} : { animationDelay: `${i * 60}ms` }
+                    }
+                  >
+                    {/* Protocol + Asset */}
+                    <div>
+                      <div className="flex items-center gap-3 mb-4">
+                        <div
+                          className={`w-10 h-10 rounded-xl bg-gradient-to-br ${gradient} flex items-center justify-center text-white text-xs font-bold shadow-lg`}
+                        >
+                          {entry.protocol.slice(0, 2).toUpperCase()}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="font-semibold text-white tracking-wide truncate">
+                            {entry.protocol}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {entry.category}
+                          </p>
+                        </div>
+                        <VaultRiskBadge
+                          risk={entry.risk}
+                          id={`grid-${getApyRowId(entry)}`}
+                        />
+                      </div>
+
+                      {/* Freshness Indicator */}
+                      <div className="flex items-center gap-1.5 mb-3 text-[10px] font-medium uppercase tracking-wider">
+                        {freshness.status === "stale" ? (
+                          <span
+                            className="text-red-400 flex items-center gap-1 bg-red-400/10 px-2 py-0.5 rounded-full"
+                            aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${freshness.ageMinutes} minutes ago`}
+                          >
+                            <Clock size={10} aria-hidden="true" /> Stale Data ({freshness.ageMinutes}m old)
+                          </span>
+                        ) : freshness.status === "fresh" ? (
+                          <span
+                            className="text-gray-500 flex items-center gap-1"
+                            aria-label={`APY data for ${entry.protocol} ${entry.asset} updated ${freshness.ageMinutes} minutes ago`}
+                          >
+                            <Clock size={10} aria-hidden="true" /> Updated {freshness.ageMinutes}m ago
+                          </span>
+                        ) : (
+                          <span className="text-amber-300 flex items-center gap-1 bg-amber-300/10 px-2 py-0.5 rounded-full" role="status">
+                            <Clock size={10} aria-hidden="true" /> Freshness unavailable
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Asset Badge */}
+                      <div className="mb-4">
+                        <span className="bg-gradient-to-r from-[#6C5DD3]/20 to-[#6C5DD3]/10 text-[#6C5DD3] px-3 py-1.5 rounded-full text-xs font-bold border border-[#6C5DD3]/30">
+                          {entry.asset}
+                        </span>
+                      </div>
+
+                      {/* APY */}
+                      <div className="flex items-baseline gap-2 mb-1">
+                        <span className="text-3xl font-extrabold text-white">
+                          {formatRewardRate(entry.netApy ?? entry.apy, { suffix: false })}
+                        </span>
+                        <span className="text-lg font-bold text-gray-400">
+                          % APY
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-500 flex items-center gap-1.5">
+                        <span>
+                          Gross {formatRewardRate(entry.totalApy ?? entry.apy)} |
+                          Drag {formatRewardRate(entry.feeDragApy ?? 0)}
+                        </span>
+                        <button
+                          onClick={() => setIsFeeModalOpen(true)}
+                          className="text-gray-500 hover:text-white transition-colors cursor-pointer"
+                          aria-label="View fee assumptions"
+                        >
+                          <Info size={12} />
+                        </button>
+                      </p>
+
+                      {/* 24h Change + TVL */}
+                      <div className="flex items-center gap-4 text-xs mt-2">
+                        <span
+                          className={`flex items-center gap-0.5 font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}
+                        >
+                          {isPositive ? (
+                            <ArrowUpRight size={12} />
+                          ) : (
+                            <ArrowDownRight size={12} />
+                          )}
+                          {formatRewardRate(entry.change24h, { showPositiveSign: true })} 24h
+                        </span>
+                        <span className="text-gray-500">
+                          TVL {formatTvl(entry.tvl)}
+                        </span>
+                      </div>
+
+                      {/* Reward Tokens */}
+                      <div className="flex gap-1.5 mt-3">
+                        {entry.rewardTokens.map((token) => (
+                          <span
+                            key={token}
+                            className="bg-white/5 border border-white/10 text-[10px] text-gray-400 font-medium px-2 py-0.5 rounded-md"
+                          >
+                            {token}
+                          </span>
+                        ))}
+                      </div>
+                      {entry.capitalEfficiency && (
+                        <div className="mt-3 text-xs text-gray-400">
+                          Capital efficiency:{" "}
+                          <span className="text-white font-semibold">
+                            {entry.capitalEfficiency.score.toFixed(1)} (
+                            {entry.capitalEfficiency.grade})
+                          </span>
+                        </div>
+                      )}
+                      {entry.netYieldSensitivity?.length ? (
+                        <div className="mt-2 text-[11px] text-gray-500">
+                          Sensitivity L/M/H:{" "}
+                          {entry.netYieldSensitivity
+                            .map(
+                              (s) =>
+                                `${s.environment[0].toUpperCase()}:${formatRewardRate(s.netApy)}`,
+                            )
+                            .join(" ")}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    {/* Action */}
+                    <button className="btn-secondary text-sm w-full mt-5 py-2.5 opacity-80 group-hover:opacity-100 group-hover:bg-[#6C5DD3] group-hover:border-[#6C5DD3] group-hover:text-white transition-all flex items-center justify-center gap-2">
+                      Deposit <ExternalLink size={13} />
+                    </button>
+                  </div>
+                );
+              })}
+        </div>
+      )}
+
+      {!loading && apyData.length === 0 && (
+        <div
+          className="glass-panel p-16"
+          data-testid="apy-empty-state"
+        >
+          <EmptyState
+            icon={<AlertTriangle size={32} className="text-gray-500" />}
+            title={EMPTY_STATE_APY.title}
+            description={EMPTY_STATE_APY.description}
+            action={{
+              label: refreshing ? "Refreshing…" : "Refresh",
+              onClick: handleRefresh,
+              loading: refreshing && !reducedMotion,
+            }}
+            testId="apy-empty-state-content"
+          />
+        </div>
+      )}
+
+      {/* Table View */}
+      {viewMode === "table" && apyData.length > 0 && (
+        <div className="glass-panel overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="bg-[rgba(255,255,255,0.02)] text-gray-400 text-xs uppercase tracking-wider">
+                  <th
+                    className="px-6 py-4 font-semibold"
+                    aria-sort={getAriaSort(
+                      "protocol",
+                      sortField,
+                      sortDirection,
+                    )}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSort("protocol")}
+                      aria-pressed={sortField === "protocol"}
+                      aria-label={getSortButtonLabel(
+                        "protocol",
+                        sortField,
+                        sortDirection,
+                      )}
+                      className="group inline-flex items-center uppercase tracking-wider text-left"
+                    >
+                      Protocol <SortIcon field="protocol" />
+                    </button>
+                  </th>
+                  <th className="px-6 py-4 font-semibold">Asset</th>
+                  <th
+                    className="px-6 py-4 font-semibold"
+                    aria-sort={getAriaSort("apy", sortField, sortDirection)}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSort("apy")}
+                      aria-pressed={sortField === "apy"}
+                      aria-label={getSortButtonLabel(
+                        "apy",
+                        sortField,
+                        sortDirection,
+                      )}
+                      className="group inline-flex items-center uppercase tracking-wider text-left"
+                    >
+                      APY <SortIcon field="apy" />
+                    </button>
+                  </th>
+                  <th className="px-6 py-4 font-semibold">24h Change</th>
+                  <th
+                    className="px-6 py-4 font-semibold"
+                    aria-sort={getAriaSort("tvl", sortField, sortDirection)}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSort("tvl")}
+                      aria-pressed={sortField === "tvl"}
+                      aria-label={getSortButtonLabel(
+                        "tvl",
+                        sortField,
+                        sortDirection,
+                      )}
+                      className="group inline-flex items-center uppercase tracking-wider text-left"
+                    >
+                      TVL <SortIcon field="tvl" />
+                    </button>
+                  </th>
+                  <th
+                    className="px-6 py-4 font-semibold"
+                    aria-sort={getAriaSort("risk", sortField, sortDirection)}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSort("risk")}
+                      aria-pressed={sortField === "risk"}
+                      aria-label={getSortButtonLabel(
+                        "risk",
+                        sortField,
+                        sortDirection,
+                      )}
+                      className="group inline-flex items-center uppercase tracking-wider text-left"
+                    >
+                      Risk <SortIcon field="risk" />
+                    </button>
+                  </th>
+                  <th className="px-6 py-4 font-semibold text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[rgba(255,255,255,0.05)]">
+                {loading
+                  ? Array.from({ length: 6 }).map((_, i) => (
+                      <SkeletonTableRow key={i} />
+                    ))
+                  : filtered.map((entry, i) => {
+                      const gradient =
+                        PROTOCOL_COLORS[entry.protocol] ??
+                        "from-gray-500/80 to-gray-600/80";
+                      const isPositive = entry.change24h >= 0;
+
+                      const freshness = getYieldSourceFreshness(entry);
+
+                      return (
+                        <tr
+                          key={`${entry.protocol}-${entry.asset}`}
+                          className="group hover:bg-[rgba(255,255,255,0.03)] transition-colors"
+                          style={
+                            reducedMotion
+                              ? {}
+                              : { animationDelay: `${i * 40}ms` }
+                          }
+                        >
+                          <td className="px-6 py-5">
+                            <div className="flex items-center gap-3">
+                              <div
+                                className={`w-8 h-8 rounded-lg bg-gradient-to-br ${gradient} flex items-center justify-center text-white text-[10px] font-bold`}
+                              >
+                                {entry.protocol.slice(0, 2).toUpperCase()}
+                              </div>
+                              <div>
+                                <span className="font-semibold text-white tracking-wide">
+                                  {entry.protocol}
+                                </span>
+                                <div className="flex items-center gap-2 mt-0.5">
+                                  <p className="text-[10px] text-gray-500">
+                                    {entry.category}
+                                  </p>
+                                  {freshness.status === "stale" && (
+                                    <span
+                                      className="text-[9px] text-red-400 bg-red-400/10 px-1.5 py-px rounded uppercase"
+                                      aria-label={`Stale APY data for ${entry.protocol} ${entry.asset}; last updated ${freshness.ageMinutes} minutes ago`}
+                                    >
+                                      Stale
+                                    </span>
+                                  )}
+                                  {freshness.status === "unknown" && (
+                                    <span className="text-[9px] text-amber-300 bg-amber-300/10 px-1.5 py-px rounded uppercase" role="status">
+                                      Freshness unknown
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-5">
+                            <span className="bg-gradient-to-r from-[#6C5DD3]/20 to-[#6C5DD3]/10 text-[#6C5DD3] px-3 py-1.5 rounded-full text-xs font-bold border border-[#6C5DD3]/30">
+                              {entry.asset}
+                            </span>
+                          </td>
+                          <td className="px-6 py-5">
+                            <span className="text-green-400 font-extrabold text-lg">
+                              {formatRewardRate(entry.netApy ?? entry.apy)}
+                            </span>
+                            <p className="text-[10px] text-gray-500">
+                              Gross {formatRewardRate(entry.totalApy ?? entry.apy)}
+                            </p>
+                          </td>
+                          <td className="px-6 py-5">
+                            <span
+                              className={`flex items-center gap-1 text-sm font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}
+                            >
+                              {isPositive ? (
+                                <ArrowUpRight size={14} />
+                              ) : (
+                                <ArrowDownRight size={14} />
+                              )}
+                              {formatRewardRate(entry.change24h, { showPositiveSign: true })}
+                            </span>
+                          </td>
+                          <td className="px-6 py-5 text-gray-300 font-medium">
+                            {formatTvl(entry.tvl)}
+                          </td>
+                          <td className="px-6 py-5">
+                            <VaultRiskBadge
+                              risk={entry.risk}
+                              id={`table-${getApyRowId(entry)}`}
+                            />
+                          </td>
+                          <td className="px-6 py-5 text-right">
+                            {entry.capitalEfficiency && (
+                              <p className="text-[10px] text-gray-500 mb-1">
+                                CES {entry.capitalEfficiency.score.toFixed(1)} (
+                                {entry.capitalEfficiency.grade})
+                              </p>
+                            )}
+                            <button className="btn-secondary text-sm px-5 py-2 opacity-80 group-hover:opacity-100 group-hover:bg-[#6C5DD3] group-hover:border-[#6C5DD3] group-hover:text-white transition-all shadow-md">
+                              Deposit
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Empty State */}
+          {!loading && filtered.length === 0 && (
+            <div className="px-6 py-16 text-center">
+              <Search size={32} className="text-gray-600 mx-auto mb-4" />
+              <p className="text-gray-400 font-medium">
+                No matching yields found
+              </p>
+              <p className="text-gray-600 text-sm mt-1">
+                Try adjusting your search or filters
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Card Grid Empty State */}
+      {viewMode === "grid" &&
+        !loading &&
+        apyData.length > 0 &&
+        filtered.length === 0 && (
+          <div className="glass-panel p-16 text-center">
+            <Search size={32} className="text-gray-600 mx-auto mb-4" />
+            <p className="text-gray-400 font-medium">
+              No matching yields found
+            </p>
+            <p className="text-gray-600 text-sm mt-1">
+              Try adjusting your search or filters
+            </p>
+          </div>
+        )}
+
+      <LiquidityBufferPanel
+        recommendations={[
+          {
+            strategyId: "Blend-USDC",
+            stressLevel: "low",
+            recommendedBufferPct: 0.12,
+            recommendedBufferUsd: 180_000,
+            rationale: [],
+          },
+          {
+            strategyId: "Soroswap-XLM-USDC",
+            stressLevel: "medium",
+            recommendedBufferPct: 0.21,
+            recommendedBufferUsd: 310_000,
+            rationale: [],
+          },
+        ]}
+      />
+      <FeeAssumptionsModal
+        isOpen={isFeeModalOpen}
+        onClose={() => setIsFeeModalOpen(false)}
+      />
+    </div>
+  );
+}

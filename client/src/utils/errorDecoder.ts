@@ -1,0 +1,314 @@
+/**
+ * errorDecoder.ts
+ *
+ * Utility for parsing failed Soroban / Horizon transaction results and
+ * translating raw contract error codes into human-readable messages
+ * with suggested fixes.
+ *
+ * @module errorDecoder
+ */
+
+import type { DecodedContractPanic } from "../../../shared/types/contractPanic";
+
+// ── Error Dictionary ────────────────────────────────────────────────────
+
+/**
+ * A decoded, user-friendly representation of a failed Soroban transaction.
+ */
+export interface DecodedError {
+    /** Short, human-readable title for the modal heading. */
+    title: string;
+    /** Friendly explanation shown to the end user. */
+    message: string;
+    /** Actionable suggestion to help the user recover. */
+    suggestion: string;
+    /** Raw developer log preserved for the expandable section. */
+    raw: string;
+    /** Numeric contract error code when available. */
+    code?: number;
+}
+
+/**
+ * The authoritative set of contract error codes known to the frontend.
+ * Import this in tests to guard against on-chain enum drift — if a code
+ * appears in ERROR_CODES.md but not here, tests should fail.
+ */
+export const KNOWN_CONTRACT_ERROR_CODES = new Set([
+    // YieldVault
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    // Vesting
+    1001, 1002, 1003,
+    // Donations
+    2001, 2002, 2007,
+    // Intent Swap
+    3001, 3002,
+    // Zap
+    4001,
+]);
+
+/** Zap contract: the ledger closed after the quote deadline. */
+export const ZAP_QUOTE_EXPIRED_ERROR_CODE = 4001;
+
+/** Maps known contract error codes to user-facing messages. */
+const CONTRACT_ERROR_MAP: Record<
+    number,
+    Omit<DecodedError, "raw" | "code">
+> = {
+    // ── YieldVault ──────────────────────────────────────────────────────
+    1: {
+        title: "Contract Not Initialized",
+        message: "The vault contract has not been set up yet.",
+        suggestion: "Please contact support — the contract admin must call initialize first.",
+    },
+    2: {
+        title: "Already Initialized",
+        message: "The vault has already been configured.",
+        suggestion: "No action needed. Try refreshing the page.",
+    },
+    3: {
+        title: "Zero Amount",
+        message: "You must deposit or withdraw an amount greater than zero.",
+        suggestion: "Enter a positive token amount and try again.",
+    },
+    4: {
+        title: "Insufficient Shares",
+        message: "You don't have enough vault shares to complete this withdrawal.",
+        suggestion: "Reduce the withdrawal amount or wait for more shares to accrue.",
+    },
+    5: {
+        title: "Unauthorised",
+        message: "Your wallet is not permitted to perform this action.",
+        suggestion: "Make sure you are connected with the correct wallet address.",
+    },
+    6: {
+        title: "Zero Supply",
+        message: "The vault has no shares in circulation, so the ratio cannot be calculated.",
+        suggestion: "Deposit funds into the vault first to establish the share ratio.",
+    },
+    7: {
+        title: "Vault Paused",
+        message: "The vault is currently paused for maintenance.",
+        suggestion: "Check the protocol announcements for an estimated resume time.",
+    },
+    8: {
+        title: "Timelock Active",
+        message: "This administrative action is still within its time-lock period.",
+        suggestion: "Wait for the timelock to expire before retrying.",
+    },
+    9: {
+        title: "Invalid Oracle Price",
+        message: "The on-chain oracle returned an invalid or stale price.",
+        suggestion: "Try again after a few seconds to allow the oracle to update.",
+    },
+    10: {
+        title: "Slippage Exceeded",
+        message: "The price moved too much during your swap. Your slippage tolerance was exceeded.",
+        suggestion: "Increase your slippage tolerance or try again when markets are calmer.",
+    },
+    11: {
+        title: "Storage Key Not Found",
+        message: "A required storage entry is missing from the contract. The vault may not be fully initialized.",
+        suggestion: "Contact support — the contract admin may need to re-initialize or migrate storage.",
+    },
+    // ── Vesting ────────────────────────────────────────────────────────
+    1001: {
+        title: "No Vesting Schedule",
+        message: "This wallet does not have an active vesting schedule.",
+        suggestion: "Confirm you are using the correct wallet address for your vesting allocation.",
+    },
+    1002: {
+        title: "Nothing to Claim",
+        message: "No tokens have vested yet. The cliff period has not been reached.",
+        suggestion: "Check the vesting schedule for your next unlock date and try again later.",
+    },
+    1003: {
+        title: "Already Claimed",
+        message: "All currently vested tokens have already been claimed.",
+        suggestion: "Wait for the next linear-unlock tick to claim additional tokens.",
+    },
+    // ── Donations ──────────────────────────────────────────────────────
+    2001: {
+        title: "Invalid Donation Percentage",
+        message: "The yield split percentage must be between 0 and 100.",
+        suggestion: "Enter a valid percentage between 0 and 100.",
+    },
+    2002: {
+        title: "Charity Not Whitelisted",
+        message: "The selected charity address is not on the protocol's whitelist.",
+        suggestion: "Choose a charity from the approved list in the Yield for Good panel.",
+    },
+    2007: {
+        title: "Donation Below Minimum",
+        message: "Donation amount is below the minimum (dust).",
+        suggestion: "Increase the yield amount or donation split before submitting.",
+    },
+    // ── Intent Swap ────────────────────────────────────────────────────
+    3001: {
+        title: "Insufficient Balance for Swap",
+        message: "You don't have enough tokens in your wallet to complete this swap.",
+        suggestion: "Add more funds or reduce the swap amount.",
+    },
+    3002: {
+        title: "Order Expired",
+        message: "Your swap intent expired before it could be matched.",
+        suggestion: "Submit a new swap order with an updated expiry.",
+    },
+
+    // ── Zap ─────────────────────────────────────────────────────────────
+    4001: {
+        title: "Quote Expired",
+        message: "The swap quote expired before your transaction reached the network, so nothing was swapped or deposited.",
+        suggestion: "Refresh the quote and submit again.",
+    },
+};
+
+// ── XDR / RPC Error Parsing ─────────────────────────────────────────────
+
+/**
+ * Attempts to extract a numeric contract error code from various error
+ * result formats returned by Soroban RPC or Horizon.
+ *
+ * Handles:
+ *  - `Error(Contract, #N)` — Soroban SDK diagnostic string
+ *  - `contract_code:N`     — custom label used by some indexers
+ *  - `Error(N)`            — simplified in-house format
+ *  - JSON `{code: N}`      — structured error objects
+ *
+ * @param raw - Raw error string or serialised object from the transaction result.
+ * @returns The parsed error code number, or `undefined` if none found.
+ */
+export function extractErrorCode(raw: string): number | undefined {
+    if (!raw) return undefined;
+
+    // Soroban SDK format: "Error(Contract, #1001)" or "WasmVm error: Error(1001)"
+    const sorobanMatch = /Error\s*\(\s*(?:Contract\s*,\s*)?#?(\d+)\s*\)/i.exec(raw);
+    if (sorobanMatch) return parseInt(sorobanMatch[1], 10);
+
+    // Indexer / custom label: "contract_code:1001"
+    const labelMatch = /contract_code\s*:\s*(\d+)/i.exec(raw);
+    if (labelMatch) return parseInt(labelMatch[1], 10);
+
+    // JSON structured payload
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        const findCode = (obj: any): number | undefined => {
+            if (obj === null || typeof obj !== "object") return undefined;
+            if ("code" in obj && typeof obj.code === "number") return obj.code;
+            if ("contract_code" in obj && typeof obj.contract_code === "number") return obj.contract_code;
+            for (const key of Object.keys(obj)) {
+                if (typeof obj[key] === "object") {
+                    const res = findCode(obj[key]);
+                    if (res !== undefined) return res;
+                }
+            }
+            return undefined;
+        };
+        const deepCode = findCode(parsed);
+        if (deepCode !== undefined) return deepCode;
+    } catch {
+        // not JSON — continue to next strategy
+    }
+
+    return undefined;
+}
+
+/**
+ * Decodes a failed Soroban transaction result (raw XDR string, RPC error
+ * message, or serialised object) into a `DecodedError` suitable for
+ * display in the Transaction Failed modal.
+ *
+ * Always returns a non-throwing result regardless of input format.
+ *
+ * When a `panic` decoded from the structured diagnostic events is available
+ * (see `TxResult.panic`), it is used instead of parsing `raw`, so the copy is
+ * deterministic and per-contract (#1339).
+ *
+ * @param raw - The raw error string from Horizon or Soroban RPC.
+ * @param panic - Structured contract failure, when the caller has one.
+ * @returns A `DecodedError` with user-friendly copy and the original raw string.
+ */
+export function decodeTransactionError(raw: string, panic?: DecodedContractPanic): DecodedError {
+    const safeRaw = typeof raw === "string" ? raw : JSON.stringify(raw);
+
+    if (panic && panic.code !== "UNDECODABLE") {
+        return {
+            title: panic.title,
+            message: panic.message,
+            suggestion: panic.remediation,
+            raw: safeRaw,
+            code: panic.contractCode,
+        };
+    }
+
+    const code = extractErrorCode(safeRaw);
+
+    if (code !== undefined && code in CONTRACT_ERROR_MAP) {
+        return {
+            ...CONTRACT_ERROR_MAP[code],
+            code,
+            raw: safeRaw,
+        };
+    }
+
+    // Network-level or wallet-rejection checks
+    if (/user declined|user rejected|cancelled/i.test(safeRaw)) {
+        return {
+            title: "Transaction Cancelled",
+            message: "You rejected the transaction in your wallet.",
+            suggestion: "Approve the transaction in Freighter if you want to proceed.",
+            raw: safeRaw,
+        };
+    }
+
+    if (/insufficient funds|balance/i.test(safeRaw)) {
+        return {
+            title: "Insufficient Funds",
+            message: "Your wallet does not have enough XLM to cover the fees.",
+            suggestion: "Add at least 2 XLM to your account and try again.",
+            raw: safeRaw,
+        };
+    }
+
+    // Partial submission / unknown finality: the transaction was sent (it has
+    // a hash) but polling never observed a terminal SUCCESS/FAILED status
+    // before the deadline. It may still land on-chain, so resubmitting is
+    // unsafe until finality is confirmed.
+    if (/pending inclusion timed out|may still land on-chain|transaction timed out/i.test(safeRaw)) {
+        return {
+            title: "Submission Status Unknown",
+            message: "Your transaction was submitted but its final status could not be confirmed in time.",
+            suggestion: "Check the transaction hash on an explorer before retrying, to avoid submitting a duplicate.",
+            raw: safeRaw,
+        };
+    }
+
+    // Finalization failure: the network reached a terminal FAILED status for
+    // a transaction that was actually included in a ledger (as opposed to a
+    // simulation-time contract error, which is decoded above via its error code).
+    if (/transaction failed on[\s-](ledger|chain)/i.test(safeRaw)) {
+        return {
+            title: "Transaction Failed On-Chain",
+            message: "The transaction was included in a ledger but did not succeed.",
+            suggestion: "Review the developer log for the failure reason, then retry with fresh simulation data.",
+            raw: safeRaw,
+        };
+    }
+
+    if (/timeout|network|fetch/i.test(safeRaw)) {
+        return {
+            title: "Network Error",
+            message: "Could not reach the Stellar network.",
+            suggestion: "Check your internet connection and try again.",
+            raw: safeRaw,
+        };
+    }
+
+    // Generic fallback
+    return {
+        title: "Transaction Failed",
+        message: "An unexpected error occurred while processing your transaction.",
+        suggestion: "Expand the developer log below and share it with support.",
+        raw: safeRaw,
+        code,
+    };
+}

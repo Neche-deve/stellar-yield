@@ -1,0 +1,239 @@
+import { Router, Request, Response } from "express";
+import rateLimit from "express-rate-limit";
+import {
+  buildTaxLotPreview,
+  createCSVStream,
+  createExportFilename,
+  previewToCsvRecords,
+  type RawTaxTransaction,
+} from "../services/export";
+import { exportService } from "../services/exportService";
+import { sendExportError } from "../utils/errorResponse";
+import { validateWalletAddress } from "../middleware/validation";
+import { safeWalletId } from "../utils/redact";
+
+type ExportPrismaClient = {
+  userTransaction: {
+    findMany(args: {
+      where: { walletAddress: string };
+      orderBy: { timestamp: "asc" };
+    }): Promise<
+      Array<{
+        action: string;
+        amount: number;
+        shares: number;
+        sharePriceAtTx: number;
+        txHash: string;
+        timestamp: Date;
+      }>
+    >;
+    count(args: { where: { walletAddress: string } }): Promise<number>;
+  };
+  $disconnect?: () => Promise<void>;
+};
+
+async function loadPrismaClient(): Promise<ExportPrismaClient | null> {
+  try {
+    const prismaModule = (await import("@prisma/client")) as unknown as {
+      PrismaClient?: new () => ExportPrismaClient;
+    };
+    if (!prismaModule.PrismaClient) return null;
+    return new prismaModule.PrismaClient();
+  } catch {
+    return null;
+  }
+}
+
+const exportRouter = Router();
+
+/**
+ * Rate limit: max 5 export requests per 15 minutes per IP.
+ *
+ * Prevents database exhaustion attacks from repeated large queries.
+ */
+const exportLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many export requests. Please try again later.",
+});
+
+async function fetchRawTransactions(
+  address: string,
+): Promise<{
+  status: "ok";
+  rawTxs: RawTaxTransaction[];
+} | {
+  status: "error";
+  httpCode: number;
+  errorCode: string;
+  message: string;
+}> {
+  const prisma = await loadPrismaClient();
+  if (!prisma) {
+    return {
+      status: "error",
+      httpCode: 503,
+      errorCode: "DB_UNAVAILABLE",
+      message: "Export database is unavailable.",
+    };
+  }
+
+  try {
+    const count = await prisma.userTransaction.count({
+      where: { walletAddress: address },
+    });
+    if (count === 0) {
+      await prisma.$disconnect?.();
+      return {
+        status: "error",
+        httpCode: 404,
+        errorCode: "NO_TRANSACTIONS",
+        message: "No transactions found for this address.",
+      };
+    }
+
+    const rawTxs = await prisma.userTransaction.findMany({
+      where: { walletAddress: address },
+      orderBy: { timestamp: "asc" },
+    });
+    await prisma.$disconnect?.();
+    return { status: "ok", rawTxs };
+  } catch (error) {
+    await prisma.$disconnect?.();
+    throw error;
+  }
+}
+
+/**
+ * GET /api/users/:address/export/preview
+ *
+ * Returns a JSON preview of the user's tax lots: cost basis, realized
+ * yield, per-row and global warnings, and a `canDownload` flag. The
+ * client renders this as a table before allowing the CSV download so
+ * users can verify the export and so missing-basis / missing-timestamp /
+ * unsupported-token cases surface up-front.
+ */
+exportRouter.get(
+  "/:address/export/preview",
+  exportLimiter,
+  validateWalletAddress,
+  async (req: Request, res: Response) => {
+    const { address } = req.params;
+    try {
+      const fetched = await fetchRawTransactions(address);
+      if (fetched.status === "error") {
+        sendExportError(res, null, {
+          statusCode: fetched.httpCode,
+          code: fetched.errorCode,
+          message: fetched.message,
+        });
+        return;
+      }
+      const preview = buildTaxLotPreview(fetched.rawTxs);
+      res.json(preview);
+    } catch (error) {
+      console.error(
+        "[export] Failed to build tax preview for address: %s",
+        encodeURIComponent(address),
+        error,
+      );
+      sendExportError(res, error, {
+        statusCode: 500,
+        code: "EXPORT_PREVIEW_FAILED",
+        message: "Failed to build tax export preview.",
+      });
+    }
+  },
+);
+
+/**
+ * GET /api/users/:address/export
+ *
+ * Fetches all historical vault events for a user, transforms them
+ * into a standardized CSV, and streams it back as a download. The
+ * route refuses to stream when the tax-lot preview would surface
+ * blocking warnings (missing basis / missing timestamp / unsupported
+ * token) so users do not receive a silently incomplete CSV.
+ *
+ * Uses streaming to handle users with thousands of transactions.
+ */
+exportRouter.get(
+  "/:address/export",
+  exportLimiter,
+  validateWalletAddress,
+  async (req: Request, res: Response) => {
+    const { address } = req.params;
+
+    try {
+      const fetched = await fetchRawTransactions(address);
+      if (fetched.status === "error") {
+        sendExportError(res, null, {
+          statusCode: fetched.httpCode,
+          code: fetched.errorCode,
+          message: fetched.message,
+        });
+        return;
+      }
+
+      const preview = buildTaxLotPreview(fetched.rawTxs);
+      if (!preview.canDownload) {
+        sendExportError(res, null, {
+          statusCode: 409,
+          code: "PREVIEW_WARNINGS_PRESENT",
+          message: "Tax export has blocking warnings; resolve them via the preview endpoint before downloading.",
+        });
+        return;
+      }
+
+      const records = previewToCsvRecords(preview);
+
+      // --- Idempotency key handling ---
+      const idempotencyKey = req.headers["idempotency-key"] as string | undefined;
+      const idempotencyParams = { address, type: "csv-export" };
+      if (idempotencyKey) {
+        const check = exportService.checkIdempotency(idempotencyKey, idempotencyParams);
+        if (check.status === "mismatch") {
+          sendExportError(res, null, {
+            statusCode: 422,
+            code: "IDEMPOTENCY_KEY_MISMATCH",
+            message: "The idempotency key has already been used with different parameters.",
+          });
+          return;
+        }
+        if (check.status === "hit" && check.result) {
+          res.setHeader("Idempotent-Replayed", "true");
+          res.status(200).json({ replayed: true });
+          return;
+        }
+      }
+
+      const filename = createExportFilename(address);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`,
+      );
+
+      const csvStream = createCSVStream(records);
+      csvStream.pipe(res);
+
+      // Store the result for future idempotent replays
+      if (idempotencyKey) {
+        exportService.storeIdempotentResult(
+          idempotencyKey,
+          idempotencyParams,
+          { version: "1.0.0", generatedAt: new Date().toISOString(), timestamp: new Date().toISOString(), appVersion: "1.0.0", opportunities: [], metadata: { totalOpportunities: 0, scoringMethodology: "csv-export", sourceFreshness: 0, filtersApplied: { address } } },
+        );
+      }
+    } catch (error) {
+      console.error("[export] Failed to export data for: %s", safeWalletId(address), error);
+      sendExportError(res, error, {
+        statusCode: 500,
+        code: "EXPORT_FAILED",
+        message: "Failed to generate export.",
+      });
+    }
+  },
+);
+
+export default exportRouter;
